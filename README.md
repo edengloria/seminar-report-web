@@ -74,3 +74,11 @@ gh api repos/<your-github-id>/<repo-name>/pages | jq .html_url
 3. `Responses API`로 요약(JSON 스키마) + map/reduce 병렬 fallback
 4. jsPDF로 PDF 생성 후 다운로드 링크 노출
 5. Markdown도 동시에 생성해 선택 다운로드
+
+## 출력 프리셋
+
+제출 폼에서 출력 프리셋을 미리 선택할 수 있습니다.
+
+- `classic` : 기본 정갈형 (기본값)
+- `compact` : 짧고 조밀한 형식
+- `academic` : 아카데믹 보고서형 (Source Notes 강조)

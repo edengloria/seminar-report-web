@@ -41,6 +41,64 @@ const reportSchema = {
   },
 };
 
+const OUTPUT_PRESETS = {
+  classic: {
+    id: "classic",
+    label: "클래식",
+    description: "명확한 항목 구분과 표준 가독성 중심",
+    mdTemplate: "classic",
+    pdf: {
+      font: "helvetica",
+      titleSize: 15,
+      headingSize: 12,
+      bodySize: 10.2,
+      lineHeight: 1.35,
+      margin: 14,
+      maxWidth: 182,
+      dividerColor: 220,
+      headingPrefix: "1.",
+    },
+  },
+  compact: {
+    id: "compact",
+    label: "컴팩트",
+    description: "짧고 조밀한 형식, PDF는 여백 축소",
+    mdTemplate: "compact",
+    pdf: {
+      font: "courier",
+      titleSize: 13.5,
+      headingSize: 11.4,
+      bodySize: 9.4,
+      lineHeight: 1.22,
+      margin: 11,
+      maxWidth: 188,
+      dividerColor: 190,
+      headingPrefix: "Ⅰ",
+    },
+  },
+  academic: {
+    id: "academic",
+    label: "아카데믹",
+    description: "학술 보고서 톤, 타임라인/주석 강조",
+    mdTemplate: "academic",
+    pdf: {
+      font: "times",
+      titleSize: 16.5,
+      headingSize: 12.5,
+      bodySize: 10.1,
+      lineHeight: 1.35,
+      margin: 16,
+      maxWidth: 178,
+      dividerColor: 140,
+      headingPrefix: "Ⅰ",
+    },
+  },
+};
+
+function getOutputPreset(presetId) {
+  return OUTPUT_PRESETS[presetId] || OUTPUT_PRESETS.classic;
+}
+
 const mapSchema = {
   type: "object",
   additionalProperties: false,
@@ -97,6 +155,7 @@ async function onSubmit(event) {
   const studentId = String(document.getElementById("student-id").value || "").trim();
   const date = String(document.getElementById("seminar-date").value || "").trim();
   const apiKey = String(document.getElementById("openai-key").value || "").trim();
+  const outputPresetId = String(document.getElementById("output-preset").value || "classic").trim();
   const fileInput = document.getElementById("audio-file");
   const file = fileInput.files[0];
 
@@ -126,6 +185,7 @@ async function onSubmit(event) {
     studentName: name,
     studentId,
     seminarDate: date,
+    outputPresetId: getOutputPreset(outputPresetId).id,
     fileName: file.name,
     file,
     status: "queued",
@@ -227,9 +287,9 @@ async function processQueue() {
     next.output.report = report;
     setStatus(next.id, "processing", "PDF 렌더링", 78);
 
-    const pdf = await renderReportPdf(next, report);
+    const pdf = await renderReportPdf(next, report, next.outputPresetId);
     next.output.pdf = pdf;
-    next.output.md = toMarkdownReport(next, report);
+    next.output.md = toMarkdownReport(next, report, next.outputPresetId);
 
     setStatus(next.id, "done", "완료", 100);
     logJob(next.id, "INFO", "job finished");
@@ -722,17 +782,20 @@ function extractOutputText(payload) {
   return lines.join("\n").trim();
 }
 
-async function renderReportPdf(job, report) {
+async function renderReportPdf(job, report, presetId = "classic") {
   setStatus(job.id, "processing", "PDF 렌더링", 80);
   const { jsPDF } = window.jspdf;
+  const preset = getOutputPreset(presetId);
+  const style = preset.pdf;
   const title = `[Seminar Report] (${job.seminarDate})`;
+  const headingPrefix = style.headingPrefix || "1";
 
   const doc = new jsPDF({ unit: "mm", format: "a4" });
-  doc.setFont("helvetica", "normal");
+  doc.setFont(style.font, "normal");
 
-  const margin = 14;
-  const maxWidth = 182;
-  const pageBottom = 285;
+  const margin = style.margin;
+  const maxWidth = style.maxWidth;
+  const pageBottom = 290 - margin;
   let y = 18;
 
   const ensureSpace = (lines, lineHeight) => {
@@ -743,9 +806,9 @@ async function renderReportPdf(job, report) {
     }
   };
 
-  const line = (txt, size = 10.2, leading = size + 2.3, style = "normal") => {
+  const line = (txt, size = 10.2, leading = size + 2.3, textStyle = "normal") => {
     doc.setFontSize(size);
-    doc.setFont("helvetica", style);
+    doc.setFont(style.font, textStyle);
     const chunks = doc.splitTextToSize(String(txt), maxWidth);
     const rows = Array.isArray(chunks) ? chunks.length : 1;
     ensureSpace(rows, leading);
@@ -753,28 +816,40 @@ async function renderReportPdf(job, report) {
     y += rows * (leading * 0.3528);
   };
 
-  line(title, 15, 20, "bold");
-  line(`${formatDateLabel(job.seminarDate)} ${job.studentName} (${job.studentId})`, 10, 14);
+  doc.setTextColor(32, 37, 64);
+  line(title, style.titleSize, style.titleSize + 4, "bold");
+  doc.setTextColor(68, 73, 95);
+  line(`${formatDateLabel(job.seminarDate)} ${job.studentName} (${job.studentId})`, style.bodySize + 1.1, 14);
+  line(`Template: ${preset.label}`, Math.max(8.6, style.bodySize - 1), 12);
   y += 2;
 
-  doc.setDrawColor(220);
+  doc.setDrawColor(style.dividerColor);
   doc.line(margin, y, margin + maxWidth, y);
   y += 6;
 
-  line("1. Summary", 12, 14, "bold");
-  report.summary_sentences.forEach((sentence, index) => line(`${String.fromCharCode(65 + index)}. ${sentence}`));
+  const sec1 = headingPrefix === "Ⅰ" ? "Ⅰ" : "1.";
+  const sec2 = headingPrefix === "Ⅰ" ? "Ⅱ" : "2.";
+  const sec3 = headingPrefix === "Ⅰ" ? "Ⅲ" : "3.";
+  const sec4 = headingPrefix === "Ⅰ" ? "Ⅳ" : "4.";
+
+  line(`${sec1} Summary`, style.headingSize, style.bodySize + 4, "bold");
+  report.summary_sentences.forEach((sentence, index) => line(`${String.fromCharCode(65 + index)}. ${sentence}`, style.bodySize));
   y += 3;
 
-  line("2. Learnings", 12, 14, "bold");
-  line(`A. ${report.learning_sentence}`);
+  line(`${sec2} Learnings`, style.headingSize, style.bodySize + 4, "bold");
+  line(`A. ${report.learning_sentence}`, style.bodySize);
   y += 3;
 
-  line("3. QnA", 12, 14, "bold");
+  line(`${sec3} QnA`, style.headingSize, style.bodySize + 4, "bold");
   (report.qna || []).slice(0, 3).forEach((pair, index) => {
-    line(`${String.fromCharCode(65 + index)}. ${pair.question || ""}`);
-    line(`i. ${pair.answer || ""}`);
+    line(`${String.fromCharCode(65 + index)}. ${pair.question || ""}`, style.bodySize);
+    line(`A. ${pair.answer || ""}`, style.bodySize);
     y += 1;
   });
+  if (Array.isArray(report.source_span_notes) && report.source_span_notes.length) {
+    line(`${sec4} Source notes`, style.headingSize, style.bodySize + 4, "bold");
+    report.source_span_notes.slice(0, 6).forEach((note, index) => line(`${index + 1}. ${note}`, style.bodySize - 0.4));
+  }
 
   const pageCount = doc.getNumberOfPages();
   const blob = new Blob([doc.output("arraybuffer")], { type: "application/pdf" });
@@ -785,13 +860,26 @@ async function renderReportPdf(job, report) {
     url,
     mime: "application/pdf",
     createdAt: new Date().toISOString(),
-    fileName: `seminar-report-${job.studentId}-${job.seminarDate}.pdf`,
-  }
+    fileName: `seminar-report-${job.studentId}-${job.seminarDate}-${preset.id}.pdf`,
+  };
 }
 
-function toMarkdownReport(job, report) {
+function toMarkdownReport(job, report, presetId = "classic") {
+  const preset = getOutputPreset(presetId);
+  if (preset.mdTemplate === "academic") {
+    return toMarkdownAcademic(job, report, preset);
+  }
+  if (preset.mdTemplate === "compact") {
+    return toMarkdownCompact(job, report, preset);
+  }
+
+  return toMarkdownClassic(job, report, preset);
+}
+
+function toMarkdownClassic(job, report, preset) {
   const lines = [];
   lines.push(`[Seminar Report] (${job.seminarDate})`);
+  lines.push(`Template: ${preset.label}`);
   lines.push(`${formatDateLabel(job.seminarDate)} ${job.studentName} (${job.studentId})`);
   lines.push("");
   lines.push("1. Summary");
@@ -805,6 +893,69 @@ function toMarkdownReport(job, report) {
     lines.push(`${String.fromCharCode(65 + index)}. ${pair.question.trim()}`);
     lines.push(`i. ${pair.answer.trim()}`);
   });
+  if (Array.isArray(report.source_span_notes) && report.source_span_notes.length > 0) {
+    lines.push("");
+    lines.push("4. Source notes");
+    report.source_span_notes.slice(0, 6).forEach((note, index) => lines.push(`${index + 1}. ${note.trim()}`));
+  }
+  return lines.join("\n");
+}
+
+function toMarkdownCompact(job, report, preset) {
+  const lines = [];
+  lines.push(`# Seminar Report`);
+  lines.push(`**Template:** ${preset.label}`);
+  lines.push(`**Date:** ${formatDateLabel(job.seminarDate)}`);
+  lines.push(`**Name:** ${job.studentName} (${job.studentId})`);
+  lines.push("");
+  lines.push("## Summary");
+  report.summary_sentences.forEach((sentence, index) => lines.push(`- ${sentence.trim()}`));
+  lines.push("");
+  lines.push("## Learnings");
+  lines.push(`- ${report.learning_sentence.trim()}`);
+  lines.push("");
+  lines.push("## QnA");
+  report.qna.forEach((pair, index) => {
+    lines.push(`${index + 1}. ${pair.question.trim()}`);
+    lines.push(`   - ${pair.answer.trim()}`);
+  });
+  if (report.source_span_notes && report.source_span_notes.length) {
+    lines.push("");
+    lines.push("## Source notes");
+    report.source_span_notes.slice(0, 6).forEach((note, index) => lines.push(`- ${note.trim()}`));
+  }
+  return lines.join("\n");
+}
+
+function toMarkdownAcademic(job, report, preset) {
+  const lines = [];
+  lines.push(`# Seminar Report`);
+  lines.push("");
+  lines.push(`- **Template:** ${preset.label}`);
+  lines.push(`- **Student:** ${job.studentName} (${job.studentId})`);
+  lines.push(`- **Date:** ${formatDateLabel(job.seminarDate)}`);
+  lines.push("");
+  lines.push("## 1. Summary");
+  report.summary_sentences.forEach((sentence, index) => lines.push(`${index + 1}. ${sentence.trim()}`));
+  lines.push("");
+  lines.push("## 2. Learnings");
+  lines.push(`- ${report.learning_sentence.trim()}`);
+  lines.push("");
+  lines.push("## 3. QnA Table");
+  lines.push("| No. | Question | Answer |");
+  lines.push("| --- | --- | --- |");
+  report.qna.forEach((pair, index) => {
+    const q = (pair.question || "").replace(/\|/g, "\\|");
+    const a = (pair.answer || "").replace(/\|/g, "\\|");
+    lines.push(`| ${index + 1} | ${q.trim()} | ${a.trim()} |`);
+  });
+  if (Array.isArray(report.source_span_notes) && report.source_span_notes.length > 0) {
+    lines.push("");
+    lines.push("## 4. Source Notes");
+    report.source_span_notes.slice(0, 6).forEach((note) => {
+      lines.push(`- ${note.trim()}`);
+    });
+  }
   return lines.join("\n");
 }
 
@@ -878,7 +1029,8 @@ function renderJobs() {
 
     const meta = document.createElement("div");
     meta.className = "muted";
-    meta.textContent = `${job.studentId} · ${job.fileName} · ${formatBytes(job.file.size)} · ${job.stage}`;
+    const preset = getOutputPreset(job.outputPresetId);
+    meta.textContent = `${job.studentId} · ${job.fileName} · ${formatBytes(job.file.size)} · 출력: ${preset.label} · ${job.stage}`;
     card.appendChild(meta);
 
     const track = document.createElement("div");
@@ -914,7 +1066,7 @@ function renderJobs() {
 
       const a2 = document.createElement("a");
       a2.href = URL.createObjectURL(new Blob([job.output.md || ""], { type: "text/markdown;charset=utf-8" }));
-      a2.download = `seminar-report-${job.studentId}-${job.seminarDate}.md`;
+      a2.download = `seminar-report-${job.studentId}-${job.seminarDate}-${getOutputPreset(job.outputPresetId).id}.md`;
       a2.className = "footer-link";
       a2.style.marginLeft = "8px";
       a2.textContent = "Markdown 다운로드";

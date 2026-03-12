@@ -34,6 +34,15 @@
               <input id="openai-key" type="password" required placeholder="sk-..." autocomplete="off" />
               <small>⚠️ 키는 코드나 저장소에 절대 저장되지 않으며, 브라우저 메모리에만 유지됩니다.</small>
             </label>
+            <label>
+              출력 프리셋
+              <select id="output-preset">
+                <option value="classic" selected>클래식 · 기본(명확한 항목 구분)</option>
+                <option value="compact">컴팩트 · 요약형(짧고 조밀)</option>
+                <option value="academic">아카데믹 · 정식 보고서형(타임라인+주석)</option>
+              </select>
+              <small>선택한 프리셋은 Markdown/PDF 양쪽 레이아웃에 동시에 반영됩니다.</small>
+            </label>
           </div>
             <label>
               녹음 파일

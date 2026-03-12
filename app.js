@@ -1,5 +1,19 @@
-const STT_MODEL = "gpt-4o-transcribe";
-const SUMMARY_MODELS = ["gpt-4o", "gpt-4o-mini"];
+const STT_MODEL_OPTIONS = ["gpt-4o-transcribe", "whisper-1"];
+const STT_MODEL_DEFAULT = STT_MODEL_OPTIONS[0];
+const SUMMARY_MODEL_OPTIONS = [
+  { value: "gpt-5.2", label: "gpt-5.2 (최신 고정밀/권장)" },
+  { value: "gpt-5.2-codex", label: "gpt-5.2-codex (코드 특화)" },
+  { value: "gpt-5.1", label: "gpt-5.1 (고정밀)" },
+  { value: "gpt-5-mini", label: "gpt-5-mini (빠른 요약)" },
+  { value: "gpt-5-nano", label: "gpt-5-nano (저비용)" },
+  { value: "gpt-4.1", label: "gpt-4.1 (균형)" },
+  { value: "gpt-4.1-mini", label: "gpt-4.1-mini (저지연)" },
+  { value: "gpt-4.1-nano", label: "gpt-4.1-nano (초저비용)" },
+  { value: "gpt-4o-mini", label: "gpt-4o-mini (범용 저비용)" },
+  { value: "o4-mini", label: "o4-mini (추론 효율형)" },
+];
+const SUMMARY_MODELS = SUMMARY_MODEL_OPTIONS.map((item) => item.value);
+const SUMMARY_MODELS_DEFAULT = SUMMARY_MODELS[0];
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
 const STT_MAX_FILE_SIZE = 25 * 1024 * 1024;
 const STT_SEGMENT_BYTES = 18 * 1024 * 1024;
@@ -11,6 +25,24 @@ const TRANSCRIBE_REQUEST_TIMEOUT_MS = 7 * 60 * 1000;
 const TRANSCRIBE_RETRY_LIMIT = 3;
 const STT_RETRY_INTERVAL_MS = 1200;
 const ALLOWED_EXTENSIONS = ["m4a", "mp3", "wav", "ogg", "flac", "aac", "opus", "webm", "mp4", "mov", "m4v", "avi", "mkv", "3gp", "oga", "ogv", "wma", "mp4a"];
+const REPORT_MIN_SUMMARY_TOTAL_CHARS = 1150;
+const REPORT_MIN_LEARNING_CHARS = 150;
+const REPORT_MIN_QA_QUESTION_CHARS = 90;
+const REPORT_MIN_QA_ANSWER_CHARS = 160;
+const REPORT_MAX_SUMMARY_SENTENCE_CHARS = 760;
+const REPORT_MAX_LEARNING_CHARS = 320;
+const REPORT_MAX_QA_QUESTION_CHARS = 280;
+const REPORT_MAX_QA_ANSWER_CHARS = 620;
+const PDF_PDF_ATTEMPT_STAGES = 5;
+const PDF_PREFERRED_FONT_SIZES = [11.0, 10.5, 9.5];
+const PDF_SUMMARY_TRUNCATION_LIMITS = [260, 220, 180, 150, 125];
+const PDF_LEARNING_TRUNCATION_LIMITS = [180, 150, 120, 100, 90];
+const PDF_QA_QUESTION_TRUNCATION_LIMITS = [220, 190, 160, 130, 110];
+const PDF_QA_ANSWER_TRUNCATION_LIMITS = [220, 180, 150, 110, 90];
+const REPORT_DENSITY_MAX_TRANSCRIPT_CHARS = 14000;
+const REPORT_DENSITY_REFINE_ROUNDS = 2;
+const RAW_TRANSCRIPT_PREVIEW_CHARS = 12000;
+const ASCII_ONLY_ERROR_MSG = "이름과 학번은 PDF 생성 안정성을 위해 영문/숫자/띄어쓰기/기호(_ . -)만 허용됩니다.";
 
 const reportSchema = {
   type: "object",
@@ -100,6 +132,119 @@ function getOutputPreset(presetId) {
   return OUTPUT_PRESETS[presetId] || OUTPUT_PRESETS.classic;
 }
 
+function resolveSummaryModel(value) {
+  const trimmed = String(value || "").trim();
+  return SUMMARY_MODELS.includes(trimmed) ? trimmed : SUMMARY_MODELS_DEFAULT;
+}
+
+function resolveSttModel(value) {
+  const trimmed = String(value || "").trim();
+  return STT_MODEL_OPTIONS.includes(trimmed) ? trimmed : STT_MODEL_DEFAULT;
+}
+
+function buildSttModelCandidates(preferredModel) {
+  const primary = resolveSttModel(preferredModel);
+  const candidates = [primary];
+  for (const model of STT_MODEL_OPTIONS) {
+    if (!candidates.includes(model)) {
+      candidates.push(model);
+    }
+  }
+  return candidates;
+}
+
+function resolveSttResponseFormats(model) {
+  const modelKey = String(model || "").toLowerCase();
+  if (modelKey.includes("gpt-4o") && modelKey.includes("transcribe")) {
+    return ["json", "text"];
+  }
+  return ["verbose_json", "json", "text"];
+}
+
+function isAsciiOnly(value) {
+  return /^[A-Za-z0-9\s._-]+$/.test(String(value || ""));
+}
+
+function sanitizeForPdf(value) {
+  return String(value || "")
+    .replace(/[^\x20-\x7E]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function truncateForDisplay(value, maxChars) {
+  const text = String(value || "").trim();
+  const limit = Math.max(1, Number(maxChars) || 0);
+  return text.length <= limit ? text : `${text.slice(0, limit - 1).trimEnd()}…`;
+}
+
+function makeRawTranscriptDisplayText(value, maxChars = RAW_TRANSCRIPT_PREVIEW_CHARS) {
+  return truncateForDisplay(
+    String(value || "")
+      .replace(/\r\n/g, "\n")
+      .trim(),
+    maxChars
+  );
+}
+
+function isReportDenseEnough(report) {
+  if (!report || typeof report !== "object") return false;
+  const summary = Array.isArray(report.summary_sentences) ? report.summary_sentences : [];
+  const qna = Array.isArray(report.qna) ? report.qna : [];
+  const learning = String(report.learning_sentence || "").trim();
+  const summaryLen = summary.join(" ").trim().length;
+  const learningLen = learning.length;
+  if (summary.length !== 3) return false;
+  if (learningLen < REPORT_MIN_LEARNING_CHARS) return false;
+  if (summaryLen < REPORT_MIN_SUMMARY_TOTAL_CHARS) return false;
+  if (qna.length !== 3) return false;
+
+  for (const pair of qna) {
+    const question = String(pair?.question || "").trim();
+    const answer = String(pair?.answer || "").trim();
+    if (question.length < REPORT_MIN_QA_QUESTION_CHARS || answer.length < REPORT_MIN_QA_ANSWER_CHARS) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function buildDensityTargets() {
+  return {
+    minSummaryChars: REPORT_MIN_SUMMARY_TOTAL_CHARS,
+    minLearningChars: REPORT_MIN_LEARNING_CHARS,
+    minQuestionChars: REPORT_MIN_QA_QUESTION_CHARS,
+    minAnswerChars: REPORT_MIN_QA_ANSWER_CHARS,
+  };
+}
+
+function getSummaryModelSummary(job) {
+  const requested = job?.requestedSummaryModel || SUMMARY_MODELS_DEFAULT;
+  const used = Array.isArray(job?.usedSummaryModels) && job.usedSummaryModels.length > 0
+    ? job.usedSummaryModels
+    : [];
+  const timeline = [];
+  if (requested) timeline.push(requested);
+  for (const item of used) {
+    if (!timeline.includes(item)) timeline.push(item);
+  }
+  return timeline.join(" → ");
+}
+
+function getSttModelSummary(job) {
+  const requested = job?.requestedSttModel || STT_MODEL_DEFAULT;
+  const used = Array.isArray(job?.usedSttModels) && job.usedSttModels.length > 0
+    ? job.usedSttModels
+    : [];
+  const timeline = [];
+  if (requested) timeline.push(requested);
+  for (const item of used) {
+    if (!timeline.includes(item)) timeline.push(item);
+  }
+  return timeline.join(" → ");
+}
+
 const mapSchema = {
   type: "object",
   additionalProperties: false,
@@ -169,11 +314,16 @@ async function onSubmit(event) {
   const date = String(document.getElementById("seminar-date").value || "").trim();
   const apiKey = String(document.getElementById("openai-key").value || "").trim();
   const outputPresetId = String(document.getElementById("output-preset").value || "classic").trim();
+  const requestedSummaryModel = resolveSummaryModel(document.getElementById("summary-model")?.value);
   const fileInput = document.getElementById("audio-file");
   const file = fileInput.files[0];
 
   if (!name || !studentId || !date || !apiKey || !file) {
     formError.textContent = "모든 항목을 입력해 주세요.";
+    return;
+  }
+  if (!isAsciiOnly(name) || !isAsciiOnly(studentId)) {
+    formError.textContent = ASCII_ONLY_ERROR_MSG;
     return;
   }
   if (file.size > MAX_FILE_SIZE) {
@@ -205,6 +355,10 @@ async function onSubmit(event) {
     studentId,
     seminarDate: date,
     outputPresetId: getOutputPreset(outputPresetId).id,
+    requestedSummaryModel,
+    requestedSttModel: STT_MODEL_DEFAULT,
+    usedSummaryModels: [],
+    usedSttModels: [],
     fileName: file.name,
     file,
     apiKey,
@@ -411,6 +565,26 @@ function setStatus(jobId, status, stage, progress, detail) {
   scheduleRender({ jobs: true, live: true });
 }
 
+function recordSummaryModelUsage(job, model) {
+  if (!job || !model) return;
+  if (!Array.isArray(job.usedSummaryModels)) {
+    job.usedSummaryModels = [];
+  }
+  if (!job.usedSummaryModels.includes(model)) {
+    job.usedSummaryModels.push(model);
+  }
+}
+
+function recordSttModelUsage(job, model) {
+  if (!job || !model) return;
+  if (!Array.isArray(job.usedSttModels)) {
+    job.usedSttModels = [];
+  }
+  if (!job.usedSttModels.includes(model)) {
+    job.usedSttModels.push(model);
+  }
+}
+
 async function processQueue() {
   if (appState.activeJobId) return;
   const next = appState.jobs.find((j) => j.status === "queued");
@@ -429,11 +603,17 @@ async function processQueue() {
     next.output.transcript = transcript;
     setStatus(next.id, "processing", "요약 생성", 45, "요약 텍스트 정합성 검사");
 
-    const report = await summarizeTranscript(next, transcript);
+    const summary = await summarizeTranscript(next, transcript);
+    const report = summary.report;
+    const modelSummary = (summary.usedModels || []).join(" / ") || next.requestedSummaryModel;
+    logJob(next.id, "INFO", `요약 완료: 사용 모델 ${modelSummary}`);
     next.output.report = normalizeReportOutput(report);
     setStatus(next.id, "processing", "PDF 렌더링", 78, "PDF 레이아웃 구성");
 
     const pdf = await renderReportPdf(next, report, next.outputPresetId);
+    const pdfFitMode = pdf?.fitMode || "unknown";
+    logJob(next.id, "INFO", `PDF 렌더링 완료 (fitMode: ${pdfFitMode})`);
+    next.output.pdfFitMode = pdfFitMode;
     next.output.pdf = pdf;
     next.output.md = toMarkdownReport(next, report, next.outputPresetId);
 
@@ -484,7 +664,14 @@ async function transcribeAudio(job) {
 
   if (job.file.size <= STT_MAX_FILE_SIZE) {
     logJob(job.id, "INFO", `single pass 전사 시작: ${formatBytes(job.file.size)} (임계값 ${formatBytes(STT_MAX_FILE_SIZE)})`);
-    const single = await transcribeChunkWithAutoRetry(apiKey, job.id, job.file, 0, STT_SEGMENT_BYTES);
+    const single = await transcribeChunkWithAutoRetry(
+      apiKey,
+      job.id,
+      job.file,
+      0,
+      STT_SEGMENT_BYTES,
+      job.requestedSttModel
+    );
     const singleText = String(single?.text || "").trim();
     const singleSegments = Array.isArray(single?.segments) ? single.segments : [];
     const restoredSingleText = singleText || singleSegments.map((s) => String(s?.text || "").trim()).filter(Boolean).join(" ").trim();
@@ -495,6 +682,11 @@ async function transcribeAudio(job) {
       logJob(job.id, "WARN", `single pass text가 비어 segments 기반으로 복구했습니다. (segments=${singleSegments.length})`);
     }
     job.output.transcriptAligned = singleSegments;
+    job.output.rawTranscript = restoredSingleText;
+    job.output.rawTranscriptPreDedupe = restoredSingleText;
+    job.output.rawTranscriptPreDedupeLength = restoredSingleText.length;
+    job.output.rawTranscriptLength = restoredSingleText.length;
+    job.output.rawTranscriptSegments = Array.isArray(singleSegments) ? singleSegments.length : 0;
     logJob(job.id, "INFO", "transcription completed without split");
     setStatus(job.id, "processing", "요약으로 텍스트 정리", 35, "단일 청크 완결");
     return restoredSingleText;
@@ -539,7 +731,8 @@ async function transcribeAudio(job) {
       job.id,
       segment.blob,
       segment.startTimeSec,
-      STT_SEGMENT_BYTES
+      STT_SEGMENT_BYTES,
+      job.requestedSttModel
     );
     const chunkText = String(result.text || "").trim();
     if (chunkText) {
@@ -577,6 +770,11 @@ async function transcribeAudio(job) {
   const dedupText = dedupeTranscriptText(mergedText) || mergedText;
   const dedupSegments = dedupeAlignedSegments(combinedSegments);
   const finalSegments = dedupSegments.length > 0 ? dedupSegments : combinedSegments;
+  job.output.rawTranscriptPreDedupe = mergedText;
+  job.output.rawTranscript = dedupText;
+  job.output.rawTranscriptLength = dedupText.length;
+  job.output.rawTranscriptPreDedupeLength = mergedText.length;
+  job.output.rawTranscriptSegments = finalSegments.length;
   logJob(
     job.id,
     "INFO",
@@ -587,59 +785,70 @@ async function transcribeAudio(job) {
   return dedupText;
 }
 
-async function transcribeSingleFile(file, apiKey, timeOffsetSec = 0) {
-  const model = STT_MODEL;
-  const formats = model.includes("gpt-4o") ? ["json", "text"] : ["verbose_json", "json", "text"];
+async function transcribeSingleFile(file, apiKey, timeOffsetSec = 0, preferredModel = STT_MODEL_DEFAULT) {
   let lastError = null;
-  for (const responseFormat of formats) {
-    try {
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("model", model);
-      formData.append("response_format", responseFormat);
-      const res = await withTimeout(
-        fetch("https://api.openai.com/v1/audio/transcriptions", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${apiKey}` },
-          body: formData,
-        }),
-        TRANSCRIBE_REQUEST_TIMEOUT_MS,
-        "transcribe"
-      );
-      if (!res.ok) {
-        const body = await res.text();
-        const err = new Error(`OpenAI audio API ${res.status}: ${body}`);
-        lastError = err;
-        if (!body.includes("unsupported") && !body.includes("unsupported_value")) {
+  const job = appState.jobs.find((j) => j.id === appState.activeJobId);
+  const models = buildSttModelCandidates(preferredModel);
+  for (const model of models) {
+    const responseFormats = resolveSttResponseFormats(model);
+    for (const responseFormat of responseFormats) {
+      try {
+        const formData = new FormData();
+        formData.append("file", file);
+        formData.append("model", model);
+        formData.append("response_format", responseFormat);
+        const res = await withTimeout(
+          fetch("https://api.openai.com/v1/audio/transcriptions", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${apiKey}` },
+            body: formData,
+          }),
+          TRANSCRIBE_REQUEST_TIMEOUT_MS,
+          "transcribe"
+        );
+        if (!res.ok) {
+          const body = await res.text();
+          const err = new Error(`OpenAI audio API ${res.status}: ${body}`);
+          lastError = err;
+          if (responseFormat !== "text" && (body.includes("unsupported") || body.includes("unsupported_value"))) {
+            logJob(job?.id || appState.activeJobId, "WARN", `${model} / ${responseFormat} 포맷 미지원 -> 재시도`);
+            continue;
+          }
           throw err;
         }
+
+        if (responseFormat === "text") {
+          const text = (await res.text()).trim();
+          if (!text) {
+            throw new Error(`${model} text 응답이 비어 있습니다.`);
+          }
+          recordSttModelUsage(job, model);
+          return { text, segments: [{ start: timeOffsetSec, end: timeOffsetSec, text }] };
+        }
+
+        const payload = await res.json();
+        const parsed = extractTranscriptFromPayload(payload, timeOffsetSec);
+        const hasText = Boolean(parsed?.text);
+        const hasSegments = Array.isArray(parsed?.segments) && parsed.segments.length > 0;
+        if (!hasText && !hasSegments) {
+          throw new Error(`${model} 응답 파싱 결과가 비어 있습니다.`);
+        }
+        recordSttModelUsage(job, model);
+        return parsed;
+      } catch (error) {
+        lastError = error;
         if (responseFormat !== "text") {
-          logJob(appState.activeJobId, "WARN", `${responseFormat} 포맷 미지원 또는 오류 -> fallback`);
+          logJob(job?.id || appState.activeJobId, "WARN", `${model}/${responseFormat} 실패 -> 재시도`);
           continue;
         }
-        throw err;
+        logJob(job?.id || appState.activeJobId, "WARN", `${model}/${responseFormat} 실패 -> 다른 모델/형식 재시도`);
       }
-
-      if (responseFormat === "text") {
-        const text = (await res.text()).trim();
-        return { text, segments: [{ start: timeOffsetSec, end: timeOffsetSec, text }] };
-      }
-
-      const payload = await res.json();
-      return extractTranscriptFromPayload(payload, timeOffsetSec);
-    } catch (error) {
-      lastError = error;
-      if (responseFormat !== "text") {
-        logJob(appState.activeJobId, "WARN", `${responseFormat} 포맷 실패 -> 재시도`);
-        continue;
-      }
-      throw error;
     }
   }
   throw lastError || new Error("transcription failed");
 }
 
-async function transcribeChunkWithAutoRetry(apiKey, jobId, file, timeOffsetSec = 0, targetBytes = STT_SEGMENT_BYTES) {
+async function transcribeChunkWithAutoRetry(apiKey, jobId, file, timeOffsetSec = 0, targetBytes = STT_SEGMENT_BYTES, preferredSttModel = STT_MODEL_DEFAULT) {
   if (!file || !file.size) {
     throw new Error("audio chunk is empty");
   }
@@ -649,7 +858,7 @@ async function transcribeChunkWithAutoRetry(apiKey, jobId, file, timeOffsetSec =
   try {
     const presetLabel = job ? ` [${job.outputPresetId || "N/A"}]` : "";
     logJob(jobId, "INFO", `transcribe attempt${presetLabel} ${jobLabel}`);
-    return await transcribeSingleFile(file, apiKey, timeOffsetSec);
+    return await transcribeSingleFile(file, apiKey, timeOffsetSec, preferredSttModel);
   } catch (error) {
     const message = String(error?.message || error);
     const detailSec = ((Date.now() - chunkStart) / 1000).toFixed(1);
@@ -659,14 +868,14 @@ async function transcribeChunkWithAutoRetry(apiKey, jobId, file, timeOffsetSec =
         setStatus(jobId, "processing", "Whisper 전사 중", job.progressTarget || 35, "타임아웃 재시도");
         logJob(jobId, "WARN", `transcribe timeout (${detailSec}s): ${message}`);
       }
-      return withBackoffRetry(() => transcribeSingleFile(file, apiKey, timeOffsetSec), jobId, 1);
+      return withBackoffRetry(() => transcribeSingleFile(file, apiKey, timeOffsetSec, preferredSttModel), jobId, 1);
     }
     if (isTransientTranscribeError(message)) {
       if (job) {
         setStatus(jobId, "processing", "Whisper 전사 중", job.progressTarget || 35, `일시적 오류 재시도 (소요 ${detailSec}s)`);
         logJob(jobId, "WARN", `transcribe temporary failure (${detailSec}s), retrying: ${message}`);
       }
-      return withBackoffRetry(() => transcribeSingleFile(file, apiKey, timeOffsetSec), jobId, 1);
+      return withBackoffRetry(() => transcribeSingleFile(file, apiKey, timeOffsetSec, preferredSttModel), jobId, 1);
     }
     if (!isOpenAITooLargeError(message) || targetBytes <= STT_MIN_SEGMENT_BYTES || file.size <= STT_MIN_SEGMENT_BYTES) {
       throw error;
@@ -704,7 +913,8 @@ async function transcribeChunkWithAutoRetry(apiKey, jobId, file, timeOffsetSec =
         jobId,
         chunk.blob,
         timeOffsetSec + chunk.startTimeSec,
-        nextTarget
+        nextTarget,
+        job.requestedSttModel
       );
       if (chunkResult.text) {
         textParts.push(chunkResult.text);
@@ -868,6 +1078,7 @@ function dedupeTranscriptText(text) {
     if (!normalized) continue;
 
     const tokenSet = tokenSetFromNormalized(normalized);
+    const normalizedTokens = normalized.split(/\s+/).filter(Boolean);
     let isDuplicate = false;
     for (let i = kept.length - 1; i >= 0; i--) {
       const prev = kept[i];
@@ -876,7 +1087,16 @@ function dedupeTranscriptText(text) {
         isDuplicate = true;
         break;
       }
-      if (jaccardSimilarity(tokenSet, prev.tokenSet) >= 0.97) {
+      if (jaccardSimilarity(tokenSet, prev.tokenSet) >= 0.9) {
+        isDuplicate = true;
+        break;
+      }
+      if (normalized.includes(prev.normalized) || prev.normalized.includes(normalized)) {
+        isDuplicate = true;
+        break;
+      }
+      const overlap = overlapRatio(prev.normalized, normalizedTokens.join(" "));
+      if (overlap >= 0.9) {
         isDuplicate = true;
         break;
       }
@@ -895,24 +1115,30 @@ function dedupeAlignedSegments(segments) {
   const sorted = [...segments].sort((a, b) => Number(a.start || 0) - Number(b.start || 0));
   const deduped = [];
   const recent = [];
+  const overlapWindowSec = Math.max(STT_CHUNK_OVERLAP_SECONDS * 4, 48);
 
   for (const segment of sorted) {
     const text = String(segment?.text || "").trim();
     if (!text) continue;
-    const normalized = normalizeTranscriptText(text);
+    const cleaned = postprocessSegmentText(text);
+    if (!cleaned) continue;
+    const normalized = normalizeTranscriptText(cleaned);
     if (!normalized) continue;
     const tokenSet = tokenSetFromNormalized(normalized);
     const startSec = Number(segment.start || 0);
 
     const isDuplicate = recent.some((entry) => {
-      const nearInTime = Math.abs(startSec - entry.startSec) <= Math.max(STT_CHUNK_OVERLAP_SECONDS * 4, 48);
+      const nearInTime = Math.abs(startSec - entry.startSec) <= overlapWindowSec;
       if (!nearInTime) return false;
       if (normalized === entry.normalized) return true;
-      return jaccardSimilarity(tokenSet, entry.tokenSet) >= 0.94;
+      if (jaccardSimilarity(tokenSet, entry.tokenSet) >= 0.9) return true;
+      if (normalized.includes(entry.normalized) || entry.normalized.includes(normalized)) return true;
+      return overlapRatio(entry.normalized, normalized) >= 0.88;
     });
     if (isDuplicate) continue;
 
     recent.push({
+      text: cleaned,
       normalized,
       tokenSet,
       startSec,
@@ -922,11 +1148,108 @@ function dedupeAlignedSegments(segments) {
     deduped.push({
       start: startSec,
       end: Number(segment.end || segment.start || 0),
-      text,
+      text: cleaned,
     });
   }
 
-  return deduped;
+  return mergeOverlappingSegments(deduped);
+}
+
+function overlapRatio(left, right) {
+  const leftTokens = String(left || "")
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((token) => token.length >= 2);
+  const rightTokens = String(right || "")
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((token) => token.length >= 2);
+  if (!leftTokens.length || !rightTokens.length) return 0;
+  const leftSet = new Set(leftTokens);
+  const rightSet = new Set(rightTokens);
+  const intersection = Array.from(leftSet).reduce(
+    (count, token) => (rightSet.has(token) ? count + 1 : count),
+    0
+  );
+  const union = leftSet.size + rightSet.size - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
+function postprocessSegmentText(value) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  const tokens = text.split(" ");
+  const deduped = [];
+  let prev = "";
+  for (const token of tokens) {
+    const item = String(token || "").trim();
+    if (!item) continue;
+    const normalized = normalizeTranscriptText(item);
+    if (!normalized) continue;
+    if (normalized === prev) continue;
+    deduped.push(item);
+    prev = normalized;
+  }
+  return deduped.join(" ").trim();
+}
+
+function mergeOverlappingSegments(segments) {
+  if (!Array.isArray(segments) || segments.length === 0) return [];
+  const sorted = [...segments].sort((a, b) => Number(a.start || 0) - Number(b.start || 0));
+  const merged = [];
+
+  for (const segment of sorted) {
+    if (!segment?.text) continue;
+    const text = postprocessSegmentText(segment.text);
+    if (!text) continue;
+
+    if (!merged.length) {
+      merged.push({
+        start: Number(segment.start || 0),
+        end: Number(segment.end || segment.start || 0),
+        text,
+      });
+      continue;
+    }
+
+    const current = {
+      start: Number(segment.start || 0),
+      end: Number(segment.end || segment.start || 0),
+      text,
+    };
+    const prev = merged[merged.length - 1];
+    const currentNorm = normalizeTranscriptText(current.text);
+    const prevNorm = normalizeTranscriptText(prev.text);
+    const nearTime = current.start <= prev.end + (STT_CHUNK_OVERLAP_SECONDS * 4);
+
+    if (nearTime && (overlapRatio(prevNorm, currentNorm) >= 0.9 || prevNorm.includes(currentNorm) || currentNorm.includes(prevNorm))) {
+      if (current.text.length > prev.text.length) {
+        merged[merged.length - 1] = current;
+      }
+      continue;
+    }
+
+    if (nearTime && current.start <= prev.end + 0.2 && current.text.length > 20) {
+      const mergedText = postprocessSegmentText(`${prev.text} ${current.text}`);
+      if (mergedText.length >= prev.text.length) {
+        merged[merged.length - 1] = {
+          start: prev.start,
+          end: current.end,
+          text: mergedText,
+        };
+        continue;
+      }
+    }
+
+    merged.push(current);
+  }
+
+  return merged.map((segment, index) => ({
+    start: segment.start,
+    end: segment.end,
+    text: segment.text,
+    id: `s${String(index).padStart(5, "0")}`,
+  }));
 }
 
 async function splitAudioForStt(file, targetBytes, targetSeconds = STT_CHUNK_SECONDS, overlapSeconds = STT_CHUNK_OVERLAP_SECONDS) {
@@ -1041,6 +1364,7 @@ function encodeWavFromAudioBuffer(audioBuffer) {
 
 async function summarizeTranscript(job, transcriptText) {
   const apiKey = String(job.apiKey || "").trim();
+  const preferredModel = resolveSummaryModel(job?.requestedSummaryModel);
   let effectiveTranscript = String(transcriptText || "").trim();
   if (!effectiveTranscript) {
     const aligned = Array.isArray(job?.output?.transcriptAligned) ? job.output.transcriptAligned : [];
@@ -1060,6 +1384,7 @@ async function summarizeTranscript(job, transcriptText) {
   const language = "en";
   const safeLang = language === "ko" ? "Korean" : "English";
   const tokenEstimate = Math.max(1, Math.round(effectiveTranscript.length / 3));
+  const usedModels = new Set();
 
   if (tokenEstimate <= 300_000) {
     const result = await callResponsesWithModelFallback(
@@ -1073,9 +1398,14 @@ async function summarizeTranscript(job, transcriptText) {
       },
       buildReportDeveloperPrompt(language),
       buildSinglePassPrompt(effectiveTranscript, job, language),
-      2500
+      2500,
+      preferredModel
     );
-    return result.payload;
+    usedModels.add(result.model);
+    recordSummaryModelUsage(job, result.model);
+    const base = normalizeReportOutput(result.payload);
+    const dense = await ensureReportDensity(job, apiKey, base, effectiveTranscript, preferredModel, usedModels);
+    return { report: dense, usedModels: Array.from(usedModels) };
   }
 
   const chunks = chunkForSummary(effectiveTranscript, 28000, 7000);
@@ -1100,8 +1430,11 @@ async function summarizeTranscript(job, transcriptText) {
       },
       buildMapDeveloperPrompt(language),
       prompt,
-      1800
+      1800,
+      preferredModel
     );
+    usedModels.add(result.model);
+    recordSummaryModelUsage(job, result.model);
     mapResults.push(result.payload);
   }
 
@@ -1111,8 +1444,8 @@ async function summarizeTranscript(job, transcriptText) {
     2
   )}`;
   const finalResult = await callResponsesWithModelFallback(
-    apiKey,
-    "seminar_report_reduce",
+      apiKey,
+      "seminar_report_reduce",
     {
       type: "json_schema",
       name: "seminar_report_reduce",
@@ -1121,9 +1454,14 @@ async function summarizeTranscript(job, transcriptText) {
     },
     buildReduceDeveloperPrompt(language),
     reducePrompt,
-    2200
+    2200,
+    preferredModel
   );
-  return finalResult.payload;
+  usedModels.add(finalResult.model);
+  recordSummaryModelUsage(job, finalResult.model);
+  const base = normalizeReportOutput(finalResult.payload);
+  const dense = await ensureReportDensity(job, apiKey, base, effectiveTranscript, preferredModel, usedModels);
+  return { report: dense, usedModels: Array.from(usedModels) };
 }
 
 function extractQnaHint(text) {
@@ -1163,7 +1501,9 @@ function buildReportDeveloperPrompt(language) {
     "- QnA must contain exactly 3 distinct student question/answer pairs.",
     "- Prefer the later QnA section when extracting questions.",
     "- Do not invent details not supported by the transcript.",
-    "- Keep the wording concise enough to fit on one A4 page.",
+    "- Write a full one-page level report: no extremely short bullet lines; prefer complete explanatory writing.",
+    "- Keep enough detail to be useful, but do not exceed a one-page output size.",
+    "- Each section should be concrete and include method, constraint, and outcome details where available.",
   ].join("\n");
 }
 
@@ -1188,6 +1528,89 @@ function buildReduceDeveloperPrompt(language) {
   ].join("\n");
 }
 
+function buildDensityDeveloperPrompt(language) {
+  const lang = language === "ko" ? "Korean" : "English";
+  const target = buildDensityTargets();
+  return [
+    "You refine the draft seminar report to better fill one A4 page without exceeding it.",
+    "Return only valid JSON matching the schema.",
+    `Write the result in ${lang}.`,
+    "Do not change meaning; use the same transcript facts only.",
+    "Keep exact output structure: 3 summary sentences, 1 learning sentence, 3 QnA pairs.",
+    "Avoid short, thin wording. Expand each section with concrete details from the source, but keep the output one-page length.",
+    "If a section can be improved by adding context, examples, constraints, assumptions, or methods, add them in clear concise sentences.",
+    `Ensure final text is substantial: summary total >= ${target.minSummaryChars} chars, learning >= ${target.minLearningChars} chars, QnA questions >= ${target.minQuestionChars} chars and answers >= ${target.minAnswerChars} chars.`,
+    "If source details are insufficient, keep factual and concise, but still maximize completeness.",
+  ].join("\n");
+}
+
+function buildDensityPrompt(currentReport, transcriptText) {
+  const current = currentReport && typeof currentReport === "object" ? currentReport : {};
+  return [
+    "[Current report draft]",
+    JSON.stringify(
+      {
+        title_topic: current.title_topic || "",
+        summary_sentences: Array.isArray(current.summary_sentences) ? current.summary_sentences : [],
+        learning_sentence: String(current.learning_sentence || ""),
+        qna: Array.isArray(current.qna) ? current.qna : [],
+      },
+      null,
+    2),
+    "",
+    "[Transcript excerpt]",
+    String(transcriptText || "").slice(0, REPORT_DENSITY_MAX_TRANSCRIPT_CHARS),
+    "",
+    "Requirement: keep the same keys and JSON schema, but make the content richer and denser while staying inside one-page scope.",
+  ].join("\n");
+}
+
+async function ensureReportDensity(job, apiKey, report, transcriptText, preferredSummaryModel, usedModels) {
+  if (!job || !apiKey || !report) return report;
+  let current = report;
+  const language = "en";
+
+  for (let round = 1; round <= REPORT_DENSITY_REFINE_ROUNDS; round += 1) {
+    if (isReportDenseEnough(current)) {
+      return current;
+    }
+
+    logJob(
+      job.id,
+      "INFO",
+      `요약 보강 라운드 ${round}/${REPORT_DENSITY_REFINE_ROUNDS}: 현재 길이 부족`
+    );
+    try {
+      const result = await callResponsesWithModelFallback(
+        apiKey,
+        "seminar_report_refine",
+        {
+          type: "json_schema",
+          name: "seminar_report",
+          schema: reportSchema,
+          strict: true,
+        },
+        buildDensityDeveloperPrompt(language),
+        buildDensityPrompt(current, transcriptText),
+        3600,
+        preferredSummaryModel
+      );
+      usedModels.add(result.model);
+      recordSummaryModelUsage(job, result.model);
+      current = normalizeReportOutput(result.payload);
+      logJob(job.id, "INFO", `요약 보강 완료(라운드 ${round}): ${result.model}`);
+    } catch (error) {
+      logJob(job.id, "WARN", `요약 보강 실패(라운드 ${round}, 스킵): ${String(error.message || error).slice(0, 140)}`);
+      break;
+    }
+  }
+
+  if (!isReportDenseEnough(current)) {
+    logJob(job.id, "WARN", "요약이 여전히 짧습니다. 원문 내용 한계로 추가 보강 없이 진행합니다.");
+  }
+  return current;
+}
+
 function chunkForSummary(text, targetChars, overlap) {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (!normalized) return [""];
@@ -1207,13 +1630,20 @@ function chunkForSummary(text, targetChars, overlap) {
   return chunks;
 }
 
-async function callResponsesWithModelFallback(apiKey, schemaName, schemaConfig, developerPrompt, userPrompt, maxTokens) {
+async function callResponsesWithModelFallback(apiKey, schemaName, schemaConfig, developerPrompt, userPrompt, maxTokens, preferredModel) {
   let lastError = null;
+  const candidateModels = [];
+  const primary = resolveSummaryModel(preferredModel);
+  candidateModels.push(primary);
   for (const model of SUMMARY_MODELS) {
+    if (model !== primary) candidateModels.push(model);
+  }
+
+  for (const model of candidateModels) {
     try {
       const result = await callOpenAIResponses(apiKey, model, schemaName, schemaConfig, developerPrompt, userPrompt, maxTokens);
       logJob(appState.activeJobId, "INFO", `summary: completed with ${model}`);
-      return result;
+      return { ...result, model };
     } catch (error) {
       lastError = error;
       logJob(appState.activeJobId, "WARN", `${model} summary 실패: ${String(error.message || error).slice(0, 120)}`);
@@ -1294,20 +1724,91 @@ function hasKoreanText(value) {
   return /[\uac00-\ud7af]/i.test(String(value || ""));
 }
 
-function normalizeReportOutput(report) {
+function sanitizeReportValueForPdf(value) {
+  return sanitizeForPdf(String(value || ""));
+}
+
+function sanitizePdfReportText(report) {
   const safe = report && typeof report === "object" ? report : {};
   return {
     ...safe,
-    summary_sentences: Array.isArray(safe.summary_sentences) ? safe.summary_sentences : [],
-    learning_sentence: String(safe.learning_sentence || ""),
+    summary_sentences: Array.isArray(safe.summary_sentences)
+      ? safe.summary_sentences.map((item) => sanitizeReportValueForPdf(item)).filter(Boolean)
+      : [],
+    learning_sentence: sanitizeReportValueForPdf(safe.learning_sentence),
     qna: Array.isArray(safe.qna)
       ? safe.qna
-          .filter((item) => item && (item.question || item.answer))
-          .map((item) => ({
-            question: String(item.question || ""),
-            answer: String(item.answer || ""),
+          .map((pair) => ({
+            question: sanitizeReportValueForPdf(pair?.question),
+            answer: sanitizeReportValueForPdf(pair?.answer),
           }))
+      .filter((pair) => pair.question || pair.answer)
       : [],
+  };
+}
+
+function truncateReportForPdf(report, attemptIndex = 0) {
+  const safeReport = sanitizePdfReportText(report);
+  const idx = Math.max(
+    0,
+    Math.min(PDF_PDF_ATTEMPT_STAGES - 1, Number(attemptIndex) || 0)
+  );
+  const summaryLimit = PDF_SUMMARY_TRUNCATION_LIMITS[idx] || PDF_SUMMARY_TRUNCATION_LIMITS[PDF_SUMMARY_TRUNCATION_LIMITS.length - 1];
+  const learningLimit = PDF_LEARNING_TRUNCATION_LIMITS[idx] || PDF_LEARNING_TRUNCATION_LIMITS[PDF_LEARNING_TRUNCATION_LIMITS.length - 1];
+  const questionLimit = PDF_QA_QUESTION_TRUNCATION_LIMITS[idx] || PDF_QA_QUESTION_TRUNCATION_LIMITS[PDF_QA_QUESTION_TRUNCATION_LIMITS.length - 1];
+  const answerLimit = PDF_QA_ANSWER_TRUNCATION_LIMITS[idx] || PDF_QA_ANSWER_TRUNCATION_LIMITS[PDF_QA_ANSWER_TRUNCATION_LIMITS.length - 1];
+
+  return {
+    ...safeReport,
+    summary_sentences: Array.isArray(safeReport.summary_sentences)
+      ? safeReport.summary_sentences.slice(0, 3).map((sentence) => truncateText(String(sentence || ""), summaryLimit))
+      : [],
+    learning_sentence: truncateText(String(safeReport.learning_sentence || ""), learningLimit),
+    qna: Array.isArray(safeReport.qna)
+      ? safeReport.qna.slice(0, 3).map((pair) => ({
+          question: truncateText(String(pair?.question || ""), questionLimit),
+          answer: truncateText(String(pair?.answer || ""), answerLimit),
+        }))
+      : [],
+  };
+}
+
+function truncateText(value, maxChars) {
+  const text = String(value || "");
+  const limit = Math.max(1, Number(maxChars) || 0);
+  return text.length <= limit ? text : `${text.slice(0, limit - 1).trimEnd()}…`;
+}
+
+function normalizeReportOutput(report) {
+  const safe = report && typeof report === "object" ? report : {};
+  const summary = Array.isArray(safe.summary_sentences)
+    ? safe.summary_sentences
+        .map((item) => truncateText(String(item || "").trim(), REPORT_MAX_SUMMARY_SENTENCE_CHARS))
+        .filter(Boolean)
+    : [];
+  const qnaCache = new Set();
+  const qna = Array.isArray(safe.qna)
+    ? safe.qna.reduce((list, item) => {
+        if (!item) return list;
+        const question = String(item.question || "").trim();
+        const answer = String(item.answer || "").trim();
+        const fingerprint = `${question}||${answer}`;
+        if (!question || !answer || qnaCache.has(fingerprint)) {
+          return list;
+        }
+        qnaCache.add(fingerprint);
+        list.push({
+          question: truncateText(question, REPORT_MAX_QA_QUESTION_CHARS),
+          answer: truncateText(answer, REPORT_MAX_QA_ANSWER_CHARS),
+        });
+        return list;
+      }, [])
+    : [];
+  return {
+    ...safe,
+    summary_sentences: summary.slice(0, 3),
+    learning_sentence: truncateText(String(safe.learning_sentence || ""), REPORT_MAX_LEARNING_CHARS),
+    qna: qna.slice(0, 3),
   };
 }
 
@@ -1360,82 +1861,133 @@ async function ensurePdfKoreanFont(jobId) {
 
 async function renderReportPdf(job, report, presetId = "classic") {
   setStatus(job.id, "processing", "PDF 렌더링", 80, "페이지/레코드 배치");
-  const { jsPDF } = window.jspdf;
   const preset = getOutputPreset(presetId);
   const style = preset.pdf;
-  const title = `[Seminar Report] (${job.seminarDate})`;
-  const headingPrefix = style.headingPrefix || "1";
+  const safeJobDate = sanitizeReportValueForPdf(job.seminarDate);
+  const safeStudentName = sanitizeReportValueForPdf(job.studentName);
+  const safeStudentId = sanitizeReportValueForPdf(job.studentId);
+  const safePresetLabel = sanitizeReportValueForPdf(`Template: ${preset.label || preset.id}`);
+  const safeReportBase = sanitizePdfReportText(report);
 
-  const doc = new jsPDF({ unit: "mm", format: "a4" });
   const needsKoreanFont = hasKoreanText(
-    `${title} ${job.studentName} ${job.studentId} ${report.learning_sentence} ${(report.summary_sentences || []).join(" ")} ${(report.qna || []).map((pair) => `${pair.question} ${pair.answer}`).join(" ")}`
+    `${safeJobDate} ${safeStudentName} ${safeStudentId} ${safeReportBase.learning_sentence} ${(safeReportBase.summary_sentences || []).join(" ")} ${(safeReportBase.qna || [])
+      .map((pair) => `${pair.question} ${pair.answer}`)
+      .join(" ")}`
   );
   const useKoreanFont = needsKoreanFont ? await ensurePdfKoreanFont(job.id) : false;
-  const fontFamily = useKoreanFont ? PDF_FONT.name : style.font;
-  doc.setFont(fontFamily, "normal");
+  const baseFontFamily = useKoreanFont ? PDF_FONT.name : style.font;
 
-  const margin = style.margin;
-  const maxWidth = style.maxWidth;
-  const pageBottom = 290 - margin;
-  let y = 18;
+  const buildPdfArtifact = (pdfReport, override) => {
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: "mm", format: "a4" });
+    const titleFontSize = Number(override?.titleSize) || style.titleSize;
+    const headingFontSize = Number(override?.headingSize) || style.headingSize;
+    const bodySize = Number(override?.bodySize) || style.bodySize;
+    const leading = Number(override?.leadingMultiplier) || style.lineHeight || 1.35;
+    const margin = style.margin;
+    const maxWidth = style.maxWidth;
+    const pageBottom = 290 - margin;
+    const headingPrefix = style.headingPrefix || "1.";
+    let y = 18;
+    const lines = [];
+    const safeSafeReport = sanitizePdfReportText(pdfReport);
 
-  const ensureSpace = (lines, lineHeight) => {
-    const needed = lines * lineHeight;
-    if (y + needed > pageBottom) {
-      doc.addPage();
-      y = 18;
+    const line = (txt, size, textStyle = "normal", extraGap = 0) => {
+      doc.setFontSize(size);
+      doc.setFont(baseFontFamily, textStyle);
+      const chunks = doc.splitTextToSize(String(txt), maxWidth);
+      const rows = Array.isArray(chunks) ? chunks.length : 1;
+      doc.text(chunks, margin, y);
+      y += rows * (size * leading * 0.3528) + extraGap;
+    };
+
+    doc.setTextColor(32, 37, 64);
+    line(`[Seminar Report] (${safeJobDate})`, titleFontSize, "bold");
+    doc.setTextColor(68, 73, 95);
+    line(`${sanitizeReportValueForPdf(formatDateLabel(job.seminarDate))} ${safeStudentName} (${safeStudentId})`, bodySize + 1.1);
+    line(safePresetLabel, Math.max(8.6, bodySize - 1));
+    y += 2;
+
+    doc.setDrawColor(style.dividerColor);
+    doc.line(margin, y, margin + maxWidth, y);
+    y += 6;
+
+    const sec1 = headingPrefix === "Ⅰ" ? "Ⅰ" : "1.";
+    const sec2 = headingPrefix === "Ⅰ" ? "Ⅱ" : "2.";
+    const sec3 = headingPrefix === "Ⅰ" ? "Ⅲ" : "3.";
+    line(`${sec1} Summary`, headingFontSize, "bold");
+    safeSafeReport.summary_sentences.forEach((sentence, index) => {
+      line(`${String.fromCharCode(65 + index)}. ${sentence}`, bodySize);
+    });
+    y += 3;
+
+    line(`${sec2} Learnings`, headingFontSize, "bold");
+    line(`A. ${safeSafeReport.learning_sentence}`, bodySize);
+    y += 3;
+
+    line(`${sec3} QnA`, headingFontSize, "bold");
+    (safeSafeReport.qna || []).slice(0, 3).forEach((pair, index) => {
+      line(`${String.fromCharCode(65 + index)}. ${pair.question || ""}`, bodySize);
+      line(`A. ${pair.answer || ""}`, bodySize);
+      y += 1;
+    });
+
+    return {
+      url: URL.createObjectURL(new Blob([doc.output("arraybuffer")], { type: "application/pdf" })),
+      pageCount: doc.getNumberOfPages(),
+      y,
+    };
+  };
+
+  let best = null;
+  let bestPages = Number.POSITIVE_INFINITY;
+
+  for (let attempt = 0; attempt < PDF_PDF_ATTEMPT_STAGES; attempt += 1) {
+    const candidate = truncateReportForPdf(safeReportBase, attempt);
+    for (const fontSize of PDF_PREFERRED_FONT_SIZES) {
+      const payload = buildPdfArtifact(candidate, {
+        titleSize: style.titleSize,
+        headingSize: Math.max(9.8, style.headingSize - attempt * 0.2),
+        bodySize: Math.max(8.2, fontSize - attempt * 0.2),
+        leadingMultiplier: style.lineHeight || 1.35,
+      });
+
+      const pages = payload.pageCount;
+      if (pages < bestPages) {
+        if (best?.url) {
+          URL.revokeObjectURL(best.url);
+        }
+        best = payload;
+        bestPages = pages;
+      }
+      if (pages <= 1) {
+        logJob(job.id, "INFO", `pdf generated (${pages} page) attempt=${attempt}, font=${fontSize}`);
+        setStatus(job.id, "processing", "완료", 100, "저장 완료");
+        return {
+          url: payload.url,
+          mime: "application/pdf",
+          createdAt: new Date().toISOString(),
+          fileName: `seminar-report-${safeStudentId.replace(/[^A-Za-z0-9._-]/g, "_")}-${safeJobDate || "report"}-${preset.id}.pdf`,
+          pageCount: pages,
+          fitMode: "exact",
+        };
+      }
     }
-  };
+  }
 
-  const line = (txt, size = 10.2, leading = size + 2.3, textStyle = "normal") => {
-    doc.setFontSize(size);
-    doc.setFont(fontFamily, textStyle);
-    const chunks = doc.splitTextToSize(String(txt), maxWidth);
-    const rows = Array.isArray(chunks) ? chunks.length : 1;
-    ensureSpace(rows, leading);
-    doc.text(chunks, margin, y);
-    y += rows * (leading * 0.3528);
-  };
+  if (!best) {
+    throw new Error("pdf rendering failed");
+  }
 
-  doc.setTextColor(32, 37, 64);
-  line(title, style.titleSize, style.titleSize + 4, "bold");
-  doc.setTextColor(68, 73, 95);
-  line(`${formatDateLabel(job.seminarDate)} ${job.studentName} (${job.studentId})`, style.bodySize + 1.1, 14);
-  line(`Template: ${preset.label}`, Math.max(8.6, style.bodySize - 1), 12);
-  y += 2;
-
-  doc.setDrawColor(style.dividerColor);
-  doc.line(margin, y, margin + maxWidth, y);
-  y += 6;
-
-  const sec1 = headingPrefix === "Ⅰ" ? "Ⅰ" : "1.";
-  const sec2 = headingPrefix === "Ⅰ" ? "Ⅱ" : "2.";
-  const sec3 = headingPrefix === "Ⅰ" ? "Ⅲ" : "3.";
-  line(`${sec1} Summary`, style.headingSize, style.bodySize + 4, "bold");
-  report.summary_sentences.forEach((sentence, index) => line(`${String.fromCharCode(65 + index)}. ${sentence}`, style.bodySize));
-  y += 3;
-
-  line(`${sec2} Learnings`, style.headingSize, style.bodySize + 4, "bold");
-  line(`A. ${report.learning_sentence}`, style.bodySize);
-  y += 3;
-
-  line(`${sec3} QnA`, style.headingSize, style.bodySize + 4, "bold");
-  (report.qna || []).slice(0, 3).forEach((pair, index) => {
-    line(`${String.fromCharCode(65 + index)}. ${pair.question || ""}`, style.bodySize);
-    line(`A. ${pair.answer || ""}`, style.bodySize);
-    y += 1;
-  });
-
-  const pageCount = doc.getNumberOfPages();
-  const blob = new Blob([doc.output("arraybuffer")], { type: "application/pdf" });
-  const url = URL.createObjectURL(blob);
-  logJob(job.id, "INFO", `pdf generated (${pageCount} page)`);
+  logJob(job.id, "WARN", `pdf fallback rendered with ${bestPages} page(s); 1page 미도달`);
   setStatus(job.id, "processing", "완료", 100, "저장 완료");
   return {
-    url,
+    url: best.url,
     mime: "application/pdf",
     createdAt: new Date().toISOString(),
-    fileName: `seminar-report-${job.studentId}-${job.seminarDate}-${preset.id}.pdf`,
+    fileName: `seminar-report-${safeStudentId.replace(/[^A-Za-z0-9._-]/g, "_")}-${safeJobDate || "report"}-${preset.id}.pdf`,
+    pageCount: bestPages,
+    fitMode: "fallback",
   };
 }
 
@@ -1444,6 +1996,10 @@ function revokeJobDownloadUrls(job) {
   if (job.output?.mdUrl) {
     URL.revokeObjectURL(job.output.mdUrl);
     job.output.mdUrl = null;
+  }
+  if (job.output?.rawTranscriptUrl) {
+    URL.revokeObjectURL(job.output.rawTranscriptUrl);
+    job.output.rawTranscriptUrl = null;
   }
 }
 
@@ -1561,7 +2117,9 @@ function startLiveTicker() {
     }
     const hasInlineDetail = typeof job.stage === "string" && job.stage.includes("(") && job.stage.includes(")");
     const liveDetail = !hasInlineDetail && job.progressDetail ? ` (${job.progressDetail})` : "";
-    liveMeta.textContent = `상태: ${job.stage}${liveDetail} · 진행률: ${job.progress.toFixed(1)}% · ${qtxt} · ${formatBytes(job.file.size)} · ${job.createdAt}${activityText}`;
+    const activeModel = getSummaryModelSummary(job);
+    const activeSttModel = getSttModelSummary(job);
+    liveMeta.textContent = `상태: ${job.stage}${liveDetail} · 진행률: ${job.progress.toFixed(1)}% · ${qtxt} · ${formatBytes(job.file.size)} · ${job.createdAt}${activityText} · 요약모델: ${activeModel} · STT모델: ${activeSttModel}`;
     if (Date.now() - appState.lastJobsRenderAt >= 1800) {
       appState.lastJobsRenderAt = Date.now();
       scheduleRender({ jobs: true, live: false });
@@ -1614,9 +2172,11 @@ function renderJobs() {
     const meta = document.createElement("div");
     meta.className = "muted";
     const preset = getOutputPreset(job.outputPresetId);
+    const modelSummary = getSummaryModelSummary(job);
+    const sttModelSummary = getSttModelSummary(job);
     const stageHasInlineDetail = typeof job.stage === "string" && job.stage.includes("(") && job.stage.includes(")");
     const stageText = job.progressDetail && !stageHasInlineDetail ? `${job.stage} (${job.progressDetail})` : job.stage;
-    meta.textContent = `${job.studentId} · ${job.fileName} · ${formatBytes(job.file.size)} · 출력: ${preset.label} · ${stageText}`;
+    meta.textContent = `${job.studentId} · ${job.fileName} · ${formatBytes(job.file.size)} · 출력: ${preset.label} · 요약모델: ${modelSummary} · STT: ${sttModelSummary} · ${stageText}`;
     card.appendChild(meta);
 
     const track = document.createElement("div");
@@ -1662,9 +2222,38 @@ function renderJobs() {
 
       actions.appendChild(a1);
       actions.appendChild(a2);
+
+      if (job.output?.rawTranscript) {
+        if (!job.output.rawTranscriptUrl) {
+          job.output.rawTranscriptUrl = URL.createObjectURL(
+            new Blob([job.output.rawTranscript], { type: "text/plain;charset=utf-8" })
+          );
+        }
+        const a3 = document.createElement("a");
+        a3.href = job.output.rawTranscriptUrl;
+        a3.download = `raw-transcript-${job.studentId}-${job.seminarDate}.txt`;
+        a3.className = "footer-link";
+        a3.style.marginLeft = "8px";
+        a3.textContent = "Raw STT 다운로드";
+        actions.appendChild(a3);
+      }
     }
 
     card.appendChild(actions);
+
+    const rawPreview = document.createElement("details");
+    rawPreview.className = "job-raw-transcript";
+    const rawSummary = document.createElement("summary");
+    const sourceLen = job.output?.rawTranscriptPreDedupeLength || 0;
+    rawSummary.textContent = `Raw STT 결과 (${job.output?.rawTranscriptLength || 0}자 / 원본 ${
+      sourceLen ? `${sourceLen}자` : "미기록"
+    })`;
+    rawPreview.appendChild(rawSummary);
+    const rawBody = document.createElement("pre");
+    rawBody.className = "job-raw-transcript__text";
+    rawBody.textContent = makeRawTranscriptDisplayText(job.output?.rawTranscript, RAW_TRANSCRIPT_PREVIEW_CHARS);
+    rawPreview.appendChild(rawBody);
+    card.appendChild(rawPreview);
 
     const log = document.createElement("div");
     renderJobLogSummary(log, job.logs, 3);

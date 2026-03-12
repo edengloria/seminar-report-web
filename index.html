@@ -23,11 +23,13 @@
           <div class="grid two-col">
             <label>
               이름
-              <input id="student-name" required placeholder="예: 홍길동" />
+              <input id="student-name" required placeholder="영문 이름 (예: John Kim)" />
+              <small>PDF 렌더링 안정성을 위해 영문/숫자/공백/(_.-)만 허용됩니다.</small>
             </label>
             <label>
               학번
               <input id="student-id" required placeholder="예: 2026012345" />
+              <small>입력값은 PDF 안정성을 위해 영문/숫자/공백/(_.-)로만 사용하세요.</small>
             </label>
             <label>
               세미나 날짜
@@ -46,6 +48,22 @@
                 <option value="academic">아카데믹 · 보고서 톤</option>
               </select>
               <small>선택한 프리셋은 Markdown/PDF 양쪽에 동시에 적용됩니다.</small>
+            </label>
+            <label>
+              요약 모델
+              <select id="summary-model">
+                <option value="gpt-5.2" selected>gpt-5.2 (최신 고정밀/권장)</option>
+                <option value="gpt-5.2-codex">gpt-5.2-codex (코드 특화)</option>
+                <option value="gpt-5.1">gpt-5.1 (고정밀)</option>
+                <option value="gpt-5-mini">gpt-5-mini (빠른 요약)</option>
+                <option value="gpt-5-nano">gpt-5-nano (저비용)</option>
+                <option value="gpt-4.1">gpt-4.1 (균형)</option>
+                <option value="gpt-4.1-mini">gpt-4.1-mini (저지연)</option>
+                <option value="gpt-4.1-nano">gpt-4.1-nano (초저비용)</option>
+                <option value="gpt-4o-mini">gpt-4o-mini (범용 저비용)</option>
+                <option value="o4-mini">o4-mini (추론 효율형)</option>
+              </select>
+              <small>선택한 요약 모델은 Responses API의 요약 단계에 적용됩니다.</small>
             </label>
           </div>
             <label>
@@ -93,6 +111,6 @@
     </main>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-    <script type="module" src="./app.js?v=20260313-11"></script>
+    <script type="module" src="./app.js?v=20260313-12"></script>
   </body>
 </html>

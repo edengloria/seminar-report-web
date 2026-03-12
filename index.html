@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Seminar Report Generator</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header>
+        <h1>Seminar Report Generator</h1>
+        <p class="muted">클라이언트에서 OpenAI API 키를 입력 받아 처리하고, 결과 PDF를 즉시 내려받을 수 있습니다.</p>
+      </header>
+
+      <section class="card">
+        <h2>1) 작업 제출</h2>
+        <form id="submit-form">
+          <div class="grid two-col">
+            <label>
+              이름
+              <input id="student-name" required placeholder="홍길동" />
+            </label>
+            <label>
+              학번
+              <input id="student-id" required placeholder="2026012345" />
+            </label>
+            <label>
+              세미나 날짜
+              <input id="seminar-date" type="date" required />
+            </label>
+            <label>
+              OpenAI API Key
+              <input id="openai-key" type="password" required placeholder="sk-..." autocomplete="off" />
+              <small>⚠️ 키는 코드나 저장소에 절대 저장되지 않으며, 브라우저 메모리에만 유지됩니다.</small>
+            </label>
+          </div>
+          <label>
+            녹음 파일
+            <input
+              id="audio-file"
+              type="file"
+              accept=".m4a,.mp3,.wav,.ogg,.flac,.aac,.opus,.webm,.mp4,.mov,.m4v,.avi,.mp3,.aac,.mp4a,.oga,.ogv"
+              required
+            />
+            <small>지원 확장자: m4a, mp3, wav, ogg, flac, aac, opus, webm, mp4, mov, m4v 등</small>
+          </label>
+          <div class="actions">
+            <button type="submit" id="submit-btn">업로드 및 처리 시작</button>
+            <button type="button" id="clear-form-btn">입력값 초기화</button>
+          </div>
+        </form>
+        <p id="form-error" class="error"></p>
+      </section>
+
+      <section class="layout">
+        <article class="card">
+          <h2>2) 진행 상태</h2>
+          <div id="jobs-list" class="jobs"></div>
+        </article>
+
+        <article class="card">
+          <h2>3) 실시간 모니터</h2>
+          <div id="live-title" class="muted">실행 중인 job이 없습니다.</div>
+          <div class="progress-wrap">
+            <div class="progress-track">
+              <div id="live-progress" class="progress-fill"></div>
+            </div>
+            <div id="live-meta" class="muted"></div>
+          </div>
+          <pre id="live-console" class="console"></pre>
+        </article>
+      </section>
+    </main>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

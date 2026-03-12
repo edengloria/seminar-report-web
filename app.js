@@ -3,6 +3,7 @@ const SUMMARY_MODELS = ["gpt-4o", "gpt-4o-mini"];
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
 const STT_MAX_FILE_SIZE = 25 * 1024 * 1024;
 const STT_SEGMENT_BYTES = 24 * 1024 * 1024;
+const STT_MIN_SEGMENT_BYTES = 6 * 1024 * 1024;
 const POLL_MS = 1000;
 const ALLOWED_EXTENSIONS = ["m4a", "mp3", "wav", "ogg", "flac", "aac", "opus", "webm", "mp4", "mov", "m4v", "avi", "mkv", "3gp", "oga", "ogv", "wma", "mp4a"];
 
@@ -313,7 +314,7 @@ async function transcribeAudio(job) {
   if (!apiKey) throw new Error("API key missing");
 
   if (job.file.size <= STT_MAX_FILE_SIZE) {
-    const single = await transcribeSingleFile(job.file, apiKey, 0);
+    const single = await transcribeChunkWithAutoRetry(apiKey, job.id, job.file, 0, STT_SEGMENT_BYTES);
     logJob(job.id, "INFO", "transcription completed without split");
     setStatus(job.id, "processing", "요약으로 텍스트 정리", 35);
     return single.text;
@@ -332,7 +333,13 @@ async function transcribeAudio(job) {
     const segment = segments[i];
     const progress = 5 + Math.round((30 * (i + 1)) / segments.length);
     setStatus(job.id, "processing", `Whisper 전사 중 (분할 ${i + 1}/${segments.length})`, progress);
-    const result = await transcribeSingleFile(segment.blob, apiKey, segment.startTimeSec);
+    const result = await transcribeChunkWithAutoRetry(
+      apiKey,
+      job.id,
+      segment.blob,
+      segment.startTimeSec,
+      STT_SEGMENT_BYTES
+    );
     if (result.text) {
       combinedTextParts.push(result.text);
     }
@@ -409,6 +416,54 @@ async function transcribeSingleFile(file, apiKey, timeOffsetSec = 0) {
     }
   }
   throw lastError || new Error("transcription failed");
+}
+
+async function transcribeChunkWithAutoRetry(apiKey, jobId, file, timeOffsetSec = 0, targetBytes = STT_SEGMENT_BYTES) {
+  if (!file || !file.size) {
+    throw new Error("audio chunk is empty");
+  }
+  try {
+    return await transcribeSingleFile(file, apiKey, timeOffsetSec);
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (!isOpenAITooLargeError(message) || targetBytes <= STT_MIN_SEGMENT_BYTES || file.size <= STT_MIN_SEGMENT_BYTES) {
+      throw error;
+    }
+
+    const nextTarget = Math.max(STT_MIN_SEGMENT_BYTES, Math.floor(targetBytes * 0.7));
+    logJob(jobId, "WARN", `세그먼트 분할 재시도: ${Math.round(targetBytes / (1024 * 1024))}MB -> ${Math.round(nextTarget / (1024 * 1024))}MB`);
+    const chunks = await splitAudioForStt(file, nextTarget);
+    if (!chunks.length) {
+      throw error;
+    }
+
+    const merged = {
+      text: "",
+      segments: [],
+    };
+    const textParts = [];
+    for (const chunk of chunks) {
+      const chunkResult = await transcribeChunkWithAutoRetry(
+        apiKey,
+        jobId,
+        chunk.blob,
+        timeOffsetSec + chunk.startTimeSec,
+        nextTarget
+      );
+      if (chunkResult.text) {
+        textParts.push(chunkResult.text);
+      }
+      if (Array.isArray(chunkResult.segments) && chunkResult.segments.length > 0) {
+        merged.segments.push(...chunkResult.segments);
+      }
+    }
+    merged.text = textParts.join("\n").trim();
+    return merged;
+  }
+}
+
+function isOpenAITooLargeError(message = "") {
+  return /25\s*MB|too\s+large|maximum\s+file\s+size|exceeds the maximum|권장\s*상한|413/i.test(message);
 }
 
 function extractTranscriptFromPayload(payload, timeOffsetSec = 0) {

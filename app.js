@@ -132,9 +132,14 @@ const mapSchema = {
 const appState = {
   jobs: [],
   activeJobId: null,
-  apiKey: "",
   startedAt: new Map(),
   progressTimer: null,
+  lastJobsRenderAt: 0,
+};
+const uiRenderQueue = {
+  queued: false,
+  jobs: false,
+  live: false,
 };
 
 const form = document.getElementById("submit-form");
@@ -184,8 +189,6 @@ async function onSubmit(event) {
     return;
   }
 
-  appState.apiKey = apiKey;
-
   const job = {
     id: `job_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
     studentName: name,
@@ -194,6 +197,7 @@ async function onSubmit(event) {
     outputPresetId: getOutputPreset(outputPresetId).id,
     fileName: file.name,
     file,
+    apiKey,
     status: "queued",
     progress: 0,
     progressTarget: 0,
@@ -209,7 +213,7 @@ async function onSubmit(event) {
   };
   appState.jobs.push(job);
   form.reset();
-  render();
+  scheduleRender({ jobs: true, live: true });
   logJob(job.id, "INFO", "submit: queued");
   if (!appState.activeJobId) {
     void processQueue();
@@ -264,6 +268,24 @@ function withTimeout(promise, ms, label = "request") {
   ]);
 }
 
+function scheduleRender(options = { jobs: true, live: true }) {
+  uiRenderQueue.jobs = uiRenderQueue.jobs || Boolean(options.jobs);
+  uiRenderQueue.live = uiRenderQueue.live || Boolean(options.live);
+  if (uiRenderQueue.queued) return;
+  uiRenderQueue.queued = true;
+
+  requestAnimationFrame(() => {
+    const shouldRenderJobs = uiRenderQueue.jobs;
+    const shouldRenderLive = uiRenderQueue.live;
+    uiRenderQueue.queued = false;
+    uiRenderQueue.jobs = false;
+    uiRenderQueue.live = false;
+
+    if (shouldRenderJobs) renderJobs();
+    if (shouldRenderLive) renderLiveConsole();
+  });
+}
+
 function renderLogTimeline(container, lines, defaultClass = "console-empty") {
   container.innerHTML = "";
   container.classList.remove("console-empty");
@@ -312,10 +334,7 @@ function logJob(jobId, level, message) {
   if (job.logs.length > 200) job.logs.shift();
   job.lastLogAt = Date.now();
   job.stallNoticeAt = null;
-  if (appState.activeJobId === jobId) {
-    renderLiveConsole();
-  }
-  renderJobs();
+  scheduleRender({ jobs: true, live: appState.activeJobId === jobId });
 }
 
 function formatBytes(bytes) {
@@ -357,7 +376,7 @@ function setStatus(jobId, status, stage, progress, detail) {
   if (status !== "processing") {
     job.startedAt = job.startedAt || null;
   }
-  render();
+  scheduleRender({ jobs: true, live: true });
 }
 
 async function processQueue() {
@@ -365,7 +384,7 @@ async function processQueue() {
   const next = appState.jobs.find((j) => j.status === "queued");
   if (!next) {
     appState.activeJobId = null;
-    render();
+    scheduleRender({ jobs: true, live: true });
     return;
   }
 
@@ -395,7 +414,7 @@ async function processQueue() {
   } finally {
     appState.activeJobId = null;
     next.progress = Math.max(next.progress, next.status === "done" ? 100 : next.progress);
-    render();
+    scheduleRender({ jobs: true, live: true });
     if (appState.jobs.some((j) => j.status === "queued")) {
       setTimeout(() => void processQueue(), 250);
     }
@@ -428,7 +447,7 @@ function renderJobLogSummary(container, lines, maxLines = 4) {
 
 async function transcribeAudio(job) {
   setStatus(job.id, "processing", "Whisper 전사 중", 5, "시작");
-  const apiKey = appState.apiKey;
+  const apiKey = String(job.apiKey || "").trim();
   if (!apiKey) throw new Error("API key missing");
 
   if (job.file.size <= STT_MAX_FILE_SIZE) {
@@ -448,7 +467,11 @@ async function transcribeAudio(job) {
   if (!segments.length) {
     throw new Error("Failed to split audio into valid chunks");
   }
-  logJob(job.id, "INFO", `초기 오디오 분할 완료: ${segments.length}개 조각 (타임윈도우 ${STT_CHUNK_SECONDS}초, 오버랩 ${STT_CHUNK_OVERLAP_SECONDS}초)`);
+  logJob(
+    job.id,
+    "INFO",
+    `초기 오디오 분할 완료: ${segments.length}개 조각 (타임윈도우 ${STT_CHUNK_SECONDS}초, 오버랩 ${STT_CHUNK_OVERLAP_SECONDS}초)`
+  );
 
   const combinedTextParts = [];
   const combinedSegments = [];
@@ -557,8 +580,7 @@ async function transcribeChunkWithAutoRetry(apiKey, jobId, file, timeOffsetSec =
   const chunkStart = Date.now();
   try {
     const presetLabel = job ? ` [${job.outputPresetId || "N/A"}]` : "";
-    const attemptLabel = targetBytes ? ` target ${Math.round(targetBytes / (1024 * 1024))}MB` : "";
-    logJob(jobId, "INFO", `transcribe attempt${presetLabel} ${jobLabel}${attemptLabel}`);
+    logJob(jobId, "INFO", `transcribe attempt${presetLabel} ${jobLabel}`);
     return await transcribeSingleFile(file, apiKey, timeOffsetSec);
   } catch (error) {
     const message = String(error?.message || error);
@@ -738,6 +760,24 @@ function normalizeTranscriptText(value) {
   return String(value || "").toLowerCase().replace(/\s+/g, " ").replace(/[^0-9a-z가-힣ㄱ-ㅎㅏ-ㅣ\s]/g, "").trim();
 }
 
+function tokenSetFromNormalized(normalized) {
+  const tokens = String(normalized || "")
+    .split(" ")
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 2);
+  return new Set(tokens);
+}
+
+function jaccardSimilarity(setA, setB) {
+  if (!setA || !setB || setA.size === 0 || setB.size === 0) return 0;
+  let intersection = 0;
+  for (const token of setA) {
+    if (setB.has(token)) intersection++;
+  }
+  const union = setA.size + setB.size - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
 function splitToSentences(text) {
   return String(text || "")
     .replace(/\r\n/g, "\n")
@@ -748,14 +788,31 @@ function splitToSentences(text) {
 
 function dedupeTranscriptText(text) {
   const sentences = splitToSentences(text);
-  const seen = new Set();
+  const kept = [];
   const output = [];
 
-  for (const sentence of sentences) {
+  for (let index = 0; index < sentences.length; index++) {
+    const sentence = sentences[index];
     const normalized = normalizeTranscriptText(sentence);
     if (!normalized) continue;
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
+
+    const tokenSet = tokenSetFromNormalized(normalized);
+    let isDuplicate = false;
+    for (let i = kept.length - 1; i >= 0; i--) {
+      const prev = kept[i];
+      if (index - prev.index > 6) break;
+      if (normalized === prev.normalized) {
+        isDuplicate = true;
+        break;
+      }
+      if (jaccardSimilarity(tokenSet, prev.tokenSet) >= 0.97) {
+        isDuplicate = true;
+        break;
+      }
+    }
+    if (isDuplicate) continue;
+
+    kept.push({ index, normalized, tokenSet });
     output.push(sentence);
   }
 
@@ -766,28 +823,33 @@ function dedupeAlignedSegments(segments) {
   if (!Array.isArray(segments)) return [];
   const sorted = [...segments].sort((a, b) => Number(a.start || 0) - Number(b.start || 0));
   const deduped = [];
-  const seen = [];
+  const recent = [];
 
   for (const segment of sorted) {
     const text = String(segment?.text || "").trim();
     if (!text) continue;
-    const normalized = normalizeTranscriptText(text).slice(0, 160);
+    const normalized = normalizeTranscriptText(text);
     if (!normalized) continue;
+    const tokenSet = tokenSetFromNormalized(normalized);
+    const startSec = Number(segment.start || 0);
 
-    const isDuplicate = seen.some((entry) => {
-      if (!entry.normalized.length || !normalized.length) return false;
-      return entry.normalized.includes(normalized) || normalized.includes(entry.normalized);
+    const isDuplicate = recent.some((entry) => {
+      const nearInTime = Math.abs(startSec - entry.startSec) <= Math.max(STT_CHUNK_OVERLAP_SECONDS * 4, 48);
+      if (!nearInTime) return false;
+      if (normalized === entry.normalized) return true;
+      return jaccardSimilarity(tokenSet, entry.tokenSet) >= 0.94;
     });
     if (isDuplicate) continue;
 
-    seen.push({
+    recent.push({
       normalized,
-      start: Number(segment.start || 0),
-      end: Number(segment.end || segment.start || 0),
-      text,
+      tokenSet,
+      startSec,
     });
+    if (recent.length > 14) recent.shift();
+
     deduped.push({
-      start: Number(segment.start || 0),
+      start: startSec,
       end: Number(segment.end || segment.start || 0),
       text,
     });
@@ -819,10 +881,9 @@ async function splitAudioForStt(file, targetBytes, targetSeconds = STT_CHUNK_SEC
       Math.floor((sampleRate * Math.max(targetBytes - 44, 0)) / Math.max(channels * 2, 1))
     );
     const maxSamplesByTime = Math.max(1, Math.floor(sampleRate * Math.max(1, targetSeconds)));
-    const maxSamplesPerChunk = Math.max(
-      1,
-      Math.min(maxSamplesBySize, maxSamplesByTime)
-    );
+    const isSizeConstrained = maxSamplesBySize < maxSamplesByTime;
+    const maxSamplesPerChunk = isSizeConstrained ? maxSamplesBySize : maxSamplesByTime;
+    const chunkWindowSec = Math.max(1, Math.round(maxSamplesPerChunk / sampleRate));
     const overlapSamples = Math.max(
       0,
       Math.min(Math.floor(sampleRate * Math.max(0, overlapSeconds)), Math.max(0, maxSamplesPerChunk - 1))
@@ -834,9 +895,9 @@ async function splitAudioForStt(file, targetBytes, targetSeconds = STT_CHUNK_SEC
     logJob(
       appState.activeJobId,
       "INFO",
-      `오디오 분할: ${chunkLabel} / 청크 ${Math.round(targetBytes / (1024 * 1024))}MB, 타임윈도우 ${
-        Math.round(maxSamplesPerChunk / sampleRate)
-      }초, 오버랩 ${Math.round(overlapSamples / sampleRate)}초, 예상 ${projectedChunkCount}개`
+      `오디오 분할: ${chunkLabel} / ${chunkWindowSec}초 타임윈도우 + 오버랩 ${Math.round(overlapSamples / sampleRate)}초, ${
+        isSizeConstrained ? "API 용량 상한 적용" : "타임 기준 우선"
+      }, 예상 ${projectedChunkCount}개 (타임라인=${STT_CHUNK_SECONDS}초)`
     );
 
     let cursor = 0;
@@ -908,7 +969,7 @@ function encodeWavFromAudioBuffer(audioBuffer) {
 }
 
 async function summarizeTranscript(job, transcriptText) {
-  const apiKey = appState.apiKey;
+  const apiKey = String(job.apiKey || "").trim();
   if (!transcriptText || !apiKey) throw new Error("No transcript text");
 
   const language = "en";
@@ -1216,6 +1277,14 @@ async function renderReportPdf(job, report, presetId = "classic") {
   };
 }
 
+function revokeJobDownloadUrls(job) {
+  if (!job || !job.output) return;
+  if (job.output?.mdUrl) {
+    URL.revokeObjectURL(job.output.mdUrl);
+    job.output.mdUrl = null;
+  }
+}
+
 function toMarkdownReport(job, report, presetId = "classic") {
   const preset = getOutputPreset(presetId);
   if (preset.mdTemplate === "academic") {
@@ -1348,7 +1417,10 @@ function startLiveTicker() {
     const hasInlineDetail = typeof job.stage === "string" && job.stage.includes("(") && job.stage.includes(")");
     const liveDetail = !hasInlineDetail && job.progressDetail ? ` (${job.progressDetail})` : "";
     liveMeta.textContent = `상태: ${job.stage}${liveDetail} · 진행률: ${job.progress.toFixed(1)}% · ${qtxt} · ${formatBytes(job.file.size)} · ${job.createdAt}${activityText}`;
-    renderLiveConsole();
+    if (Date.now() - appState.lastJobsRenderAt >= 1800) {
+      appState.lastJobsRenderAt = Date.now();
+      scheduleRender({ jobs: true, live: false });
+    }
   }, POLL_MS);
 }
 
@@ -1434,7 +1506,10 @@ function renderJobs() {
       a1.textContent = "PDF 다운로드";
 
       const a2 = document.createElement("a");
-      a2.href = URL.createObjectURL(new Blob([job.output.md || ""], { type: "text/markdown;charset=utf-8" }));
+      if (!job.output.mdUrl) {
+        job.output.mdUrl = URL.createObjectURL(new Blob([job.output.md || ""], { type: "text/markdown;charset=utf-8" }));
+      }
+      a2.href = job.output.mdUrl;
       a2.download = `seminar-report-${job.studentId}-${job.seminarDate}-${getOutputPreset(job.outputPresetId).id}.md`;
       a2.className = "footer-link";
       a2.style.marginLeft = "8px";
@@ -1454,7 +1529,6 @@ function renderJobs() {
   }
 
   if (appState.activeJobId) {
-    renderLiveConsole();
     const active = appState.jobs.find((j) => j.id === appState.activeJobId);
     if (active) {
       liveProgress.style.width = `${Math.min(100, Math.max(0, active.progress))}%`;
@@ -1482,3 +1556,13 @@ function escapeHtml(value) {
     "'": "&#39;",
   })[m]);
 }
+
+window.addEventListener("beforeunload", () => {
+  for (const job of appState.jobs) {
+    revokeJobDownloadUrls(job);
+    if (job?.output?.pdf?.url) {
+      URL.revokeObjectURL(job.output.pdf.url);
+      job.output.pdf.url = null;
+    }
+  }
+});

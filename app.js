@@ -15,7 +15,7 @@ const ALLOWED_EXTENSIONS = ["m4a", "mp3", "wav", "ogg", "flac", "aac", "opus", "
 const reportSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["title_topic", "summary_sentences", "learning_sentence", "qna", "source_span_notes"],
+  required: ["title_topic", "summary_sentences", "learning_sentence", "qna"],
   properties: {
     title_topic: { type: "string", minLength: 4 },
     summary_sentences: {
@@ -38,11 +38,6 @@ const reportSchema = {
           answer: { type: "string", minLength: 8 },
         },
       },
-    },
-    source_span_notes: {
-      type: "array",
-      items: { type: "string" },
-      maxItems: 8,
     },
   },
 };
@@ -108,7 +103,7 @@ function getOutputPreset(presetId) {
 const mapSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["summary_points", "learning_candidates", "qna_candidates", "source_span_notes"],
+  required: ["summary_points", "learning_candidates", "qna_candidates"],
   properties: {
     summary_points: { type: "array", items: { type: "string" }, maxItems: 6 },
     learning_candidates: { type: "array", items: { type: "string" }, maxItems: 4 },
@@ -125,7 +120,6 @@ const mapSchema = {
       },
       maxItems: 6,
     },
-    source_span_notes: { type: "array", items: { type: "string" }, maxItems: 6 },
   },
 };
 
@@ -135,6 +129,14 @@ const appState = {
   startedAt: new Map(),
   progressTimer: null,
   lastJobsRenderAt: 0,
+};
+const PDF_FONT = {
+  name: "NotoSansKR",
+  file: "NotoSansKR[wght].ttf",
+  url: "https://raw.githubusercontent.com/google/fonts/main/ofl/notosanskr/NotoSansKR%5Bwght%5D.ttf",
+  loaded: false,
+  loading: null,
+  failed: false,
 };
 const uiRenderQueue = {
   queued: false,
@@ -356,7 +358,14 @@ function logJob(jobId, level, message) {
   job.logs.push(makeLog(level, message));
   if (job.logs.length > 200) job.logs.shift();
   job.lastLogAt = Date.now();
-  job.stallNoticeAt = null;
+  const isStallWarning =
+    String(level || "").toUpperCase() === "WARN" &&
+    String(message || "").includes("작업 응답이 지연되고 있습니다.");
+  if (!isStallWarning) {
+    job.stallNoticeAt = null;
+  } else if (!job.stallNoticeAt) {
+    job.stallNoticeAt = Date.now();
+  }
   scheduleRender({ jobs: true, live: appState.activeJobId === jobId });
 }
 
@@ -421,7 +430,7 @@ async function processQueue() {
     setStatus(next.id, "processing", "요약 생성", 45, "요약 텍스트 정합성 검사");
 
     const report = await summarizeTranscript(next, transcript);
-    next.output.report = report;
+    next.output.report = normalizeReportOutput(report);
     setStatus(next.id, "processing", "PDF 렌더링", 78, "PDF 레이아웃 구성");
 
     const pdf = await renderReportPdf(next, report, next.outputPresetId);
@@ -1175,7 +1184,6 @@ function buildReduceDeveloperPrompt(language) {
     "You merge chunk-level notes into the final seminar report.",
     "Return only valid JSON matching the schema.",
     `Write the result in ${lang}.`,
-    "If source notes mix languages, translate them into the requested output language before writing the final report.",
     "Remove duplicates across chunks and keep the output compact enough for a one-page report.",
   ].join("\n");
 }
@@ -1282,6 +1290,74 @@ function extractOutputText(payload) {
   return lines.join("\n").trim();
 }
 
+function hasKoreanText(value) {
+  return /[\uac00-\ud7af]/i.test(String(value || ""));
+}
+
+function normalizeReportOutput(report) {
+  const safe = report && typeof report === "object" ? report : {};
+  return {
+    ...safe,
+    summary_sentences: Array.isArray(safe.summary_sentences) ? safe.summary_sentences : [],
+    learning_sentence: String(safe.learning_sentence || ""),
+    qna: Array.isArray(safe.qna)
+      ? safe.qna
+          .filter((item) => item && (item.question || item.answer))
+          .map((item) => ({
+            question: String(item.question || ""),
+            answer: String(item.answer || ""),
+          }))
+      : [],
+  };
+}
+
+function uint8ToBinaryString(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 8192) {
+    const chunk = bytes.subarray(i, i + 8192);
+    binary += String.fromCharCode(...chunk);
+  }
+  return binary;
+}
+
+async function ensurePdfKoreanFont(jobId) {
+  if (PDF_FONT.loaded) return true;
+  if (PDF_FONT.failed) return false;
+  if (PDF_FONT.loading) return PDF_FONT.loading;
+
+  PDF_FONT.loading = (async () => {
+    try {
+      const { jsPDF } = window.jspdf;
+      const response = await fetch(PDF_FONT.url, { method: "GET", mode: "cors", cache: "force-cache" });
+      if (!response.ok) {
+        throw new Error(`Font fetch failed (${response.status})`);
+      }
+      const buffer = await response.arrayBuffer();
+      if (!buffer || buffer.byteLength < 1024) {
+        throw new Error("Font payload is too small");
+      }
+
+      const binary = uint8ToBinaryString(new Uint8Array(buffer));
+      const tempDoc = new jsPDF({ unit: "mm", format: "a4" });
+      tempDoc.addFileToVFS(PDF_FONT.file, btoa(binary));
+      tempDoc.addFont(PDF_FONT.file, PDF_FONT.name, "normal");
+      tempDoc.addFont(PDF_FONT.file, PDF_FONT.name, "bold");
+      PDF_FONT.loaded = true;
+      return true;
+    } catch (error) {
+      PDF_FONT.failed = true;
+      if (jobId) {
+        logJob(jobId, "WARN", `PDF 한글 폰트 로드 실패: ${String(error.message || error).slice(0, 120)}`);
+      }
+      return false;
+    } finally {
+      PDF_FONT.loading = null;
+    }
+  })();
+
+  return PDF_FONT.loading;
+}
+
 async function renderReportPdf(job, report, presetId = "classic") {
   setStatus(job.id, "processing", "PDF 렌더링", 80, "페이지/레코드 배치");
   const { jsPDF } = window.jspdf;
@@ -1291,7 +1367,12 @@ async function renderReportPdf(job, report, presetId = "classic") {
   const headingPrefix = style.headingPrefix || "1";
 
   const doc = new jsPDF({ unit: "mm", format: "a4" });
-  doc.setFont(style.font, "normal");
+  const needsKoreanFont = hasKoreanText(
+    `${title} ${job.studentName} ${job.studentId} ${report.learning_sentence} ${(report.summary_sentences || []).join(" ")} ${(report.qna || []).map((pair) => `${pair.question} ${pair.answer}`).join(" ")}`
+  );
+  const useKoreanFont = needsKoreanFont ? await ensurePdfKoreanFont(job.id) : false;
+  const fontFamily = useKoreanFont ? PDF_FONT.name : style.font;
+  doc.setFont(fontFamily, "normal");
 
   const margin = style.margin;
   const maxWidth = style.maxWidth;
@@ -1308,7 +1389,7 @@ async function renderReportPdf(job, report, presetId = "classic") {
 
   const line = (txt, size = 10.2, leading = size + 2.3, textStyle = "normal") => {
     doc.setFontSize(size);
-    doc.setFont(style.font, textStyle);
+    doc.setFont(fontFamily, textStyle);
     const chunks = doc.splitTextToSize(String(txt), maxWidth);
     const rows = Array.isArray(chunks) ? chunks.length : 1;
     ensureSpace(rows, leading);
@@ -1330,8 +1411,6 @@ async function renderReportPdf(job, report, presetId = "classic") {
   const sec1 = headingPrefix === "Ⅰ" ? "Ⅰ" : "1.";
   const sec2 = headingPrefix === "Ⅰ" ? "Ⅱ" : "2.";
   const sec3 = headingPrefix === "Ⅰ" ? "Ⅲ" : "3.";
-  const sec4 = headingPrefix === "Ⅰ" ? "Ⅳ" : "4.";
-
   line(`${sec1} Summary`, style.headingSize, style.bodySize + 4, "bold");
   report.summary_sentences.forEach((sentence, index) => line(`${String.fromCharCode(65 + index)}. ${sentence}`, style.bodySize));
   y += 3;
@@ -1346,10 +1425,6 @@ async function renderReportPdf(job, report, presetId = "classic") {
     line(`A. ${pair.answer || ""}`, style.bodySize);
     y += 1;
   });
-  if (Array.isArray(report.source_span_notes) && report.source_span_notes.length) {
-    line(`${sec4} Source notes`, style.headingSize, style.bodySize + 4, "bold");
-    report.source_span_notes.slice(0, 6).forEach((note, index) => line(`${index + 1}. ${note}`, style.bodySize - 0.4));
-  }
 
   const pageCount = doc.getNumberOfPages();
   const blob = new Blob([doc.output("arraybuffer")], { type: "application/pdf" });
@@ -1401,11 +1476,6 @@ function toMarkdownClassic(job, report, preset) {
     lines.push(`${String.fromCharCode(65 + index)}. ${pair.question.trim()}`);
     lines.push(`i. ${pair.answer.trim()}`);
   });
-  if (Array.isArray(report.source_span_notes) && report.source_span_notes.length > 0) {
-    lines.push("");
-    lines.push("4. Source notes");
-    report.source_span_notes.slice(0, 6).forEach((note, index) => lines.push(`${index + 1}. ${note.trim()}`));
-  }
   return lines.join("\n");
 }
 
@@ -1427,11 +1497,6 @@ function toMarkdownCompact(job, report, preset) {
     lines.push(`${index + 1}. ${pair.question.trim()}`);
     lines.push(`   - ${pair.answer.trim()}`);
   });
-  if (report.source_span_notes && report.source_span_notes.length) {
-    lines.push("");
-    lines.push("## Source notes");
-    report.source_span_notes.slice(0, 6).forEach((note, index) => lines.push(`- ${note.trim()}`));
-  }
   return lines.join("\n");
 }
 
@@ -1457,13 +1522,6 @@ function toMarkdownAcademic(job, report, preset) {
     const a = (pair.answer || "").replace(/\|/g, "\\|");
     lines.push(`| ${index + 1} | ${q.trim()} | ${a.trim()} |`);
   });
-  if (Array.isArray(report.source_span_notes) && report.source_span_notes.length > 0) {
-    lines.push("");
-    lines.push("## 4. Source Notes");
-    report.source_span_notes.slice(0, 6).forEach((note) => {
-      lines.push(`- ${note.trim()}`);
-    });
-  }
   return lines.join("\n");
 }
 

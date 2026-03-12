@@ -286,12 +286,13 @@ button:focus-visible {
   display: grid;
   gap: 7px;
   min-height: 190px;
+  padding: 2px 10px 6px 30px;
 }
 
 .console-timeline::before {
   content: "";
   position: absolute;
-  left: 20px;
+  left: 22px;
   top: 12px;
   bottom: 12px;
   width: 2px;
@@ -301,17 +302,22 @@ button:focus-visible {
 
 .log-item {
   display: grid;
-  grid-template-columns: 72px 58px 1fr;
+  grid-template-columns: 78px minmax(52px, 68px) minmax(0, 1fr);
   gap: 10px;
   align-items: start;
   position: relative;
   padding-left: 8px;
+  padding-right: 4px;
+}
+
+.log-item > div {
+  min-width: 0;
 }
 
 .log-item::before {
   content: "";
   position: absolute;
-  left: 14px;
+  left: 18px;
   top: 5px;
   width: 8px;
   height: 8px;
@@ -352,6 +358,25 @@ button:focus-visible {
 .log-item-message {
   line-height: 1.5;
   color: #edf2ff;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.job-log-summary {
+  margin-top: 8px;
+  display: grid;
+  gap: 6px;
+}
+
+.job-log-summary .summary-line {
+  margin: 0;
+  padding: 0 2px;
+  color: #344054;
+  font-size: 0.76rem;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .console-empty {

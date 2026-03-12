@@ -192,6 +192,7 @@ async function onSubmit(event) {
     status: "queued",
     progress: 0,
     progressTarget: 0,
+    progressDetail: "",
     stage: "대기 중",
     logs: [makeLog("INFO", "job created")],
     createdAt: new Date().toISOString(),
@@ -209,10 +210,23 @@ async function onSubmit(event) {
 }
 
 function makeLog(level, message) {
-  return `${new Date().toLocaleTimeString()} [${level}] ${message}`;
+  return {
+    time: new Date().toLocaleTimeString(),
+    level: String(level || "INFO").toUpperCase(),
+    message: String(message || ""),
+  };
 }
 
 function parseLogLine(line) {
+  if (line && typeof line === "object") {
+    const safeLine = line;
+    return {
+      time: String(safeLine.time || "").trim(),
+      level: String(safeLine.level || "INFO").toLowerCase(),
+      message: String(safeLine.message || "").trim(),
+    };
+  }
+
   const safe = String(line || "");
   const match = safe.match(/^(.+?)\s*\[([^\]]+)\]\s*(.*)$/);
   if (!match) {
@@ -298,13 +312,16 @@ function queuePosition(jobId) {
   return idx === -1 ? null : idx + 1;
 }
 
-function setStatus(jobId, status, stage, progress) {
+function setStatus(jobId, status, stage, progress, detail) {
   const job = appState.jobs.find((j) => j.id === jobId);
   if (!job) return;
   job.status = status;
   if (typeof stage === "string") job.stage = stage;
   if (typeof progress === "number") {
     job.progressTarget = Math.max(0, Math.min(100, progress));
+  }
+  if (typeof detail !== "undefined") {
+    job.progressDetail = String(detail || "").trim();
   }
   if (status === "processing" && !job.startedAt) {
     job.startedAt = new Date().toISOString();
@@ -328,26 +345,26 @@ async function processQueue() {
   }
 
   appState.activeJobId = next.id;
-  setStatus(next.id, "processing", "전처리/인덱싱", 2);
+  setStatus(next.id, "processing", "전처리/인덱싱", 2, "큐에서 실행 대기 진입");
   logJob(next.id, "INFO", "processing started");
 
   try {
     const transcript = await transcribeAudio(next);
     next.output.transcript = transcript;
-    setStatus(next.id, "processing", "요약 생성", 45);
+    setStatus(next.id, "processing", "요약 생성", 45, "요약 텍스트 정합성 검사");
 
     const report = await summarizeTranscript(next, transcript);
     next.output.report = report;
-    setStatus(next.id, "processing", "PDF 렌더링", 78);
+    setStatus(next.id, "processing", "PDF 렌더링", 78, "PDF 레이아웃 구성");
 
     const pdf = await renderReportPdf(next, report, next.outputPresetId);
     next.output.pdf = pdf;
     next.output.md = toMarkdownReport(next, report, next.outputPresetId);
 
-    setStatus(next.id, "done", "완료", 100);
+    setStatus(next.id, "done", "완료", 100, "완료");
     logJob(next.id, "INFO", "job finished");
   } catch (error) {
-    setStatus(next.id, "error", "실패", next.progress || 0);
+    setStatus(next.id, "error", "실패", next.progress || 0, "오류");
     next.error = String(error?.message || error);
     logJob(next.id, "ERROR", `error: ${next.error}`);
   } finally {
@@ -360,15 +377,39 @@ async function processQueue() {
   }
 }
 
+function renderJobLogSummary(container, lines, maxLines = 4) {
+  container.innerHTML = "";
+  container.className = "job-log-summary";
+
+  if (!Array.isArray(lines) || lines.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "muted";
+    empty.textContent = "최근 로그가 아직 없습니다.";
+    container.appendChild(empty);
+    return;
+  }
+
+  const recent = lines.slice(-maxLines);
+  for (const raw of recent) {
+    const parsed = parseLogLine(raw);
+    const line = document.createElement("div");
+    line.className = "summary-line";
+    const levelTag = parsed.level ? `[${String(parsed.level).toUpperCase()}]` : "";
+    const time = parsed.time ? `${parsed.time} ` : "";
+    line.textContent = `${time}${levelTag} ${parsed.message || ""}`.trim();
+    container.appendChild(line);
+  }
+}
+
 async function transcribeAudio(job) {
-  setStatus(job.id, "processing", "Whisper 전사 중", 5);
+  setStatus(job.id, "processing", "Whisper 전사 중", 5, "시작");
   const apiKey = appState.apiKey;
   if (!apiKey) throw new Error("API key missing");
 
   if (job.file.size <= STT_MAX_FILE_SIZE) {
     const single = await transcribeChunkWithAutoRetry(apiKey, job.id, job.file, 0, STT_SEGMENT_BYTES);
     logJob(job.id, "INFO", "transcription completed without split");
-    setStatus(job.id, "processing", "요약으로 텍스트 정리", 35);
+    setStatus(job.id, "processing", "요약으로 텍스트 정리", 35, "단일 청크 완결");
     return single.text;
   }
 
@@ -384,7 +425,7 @@ async function transcribeAudio(job) {
   for (let i = 0; i < segments.length; i++) {
     const segment = segments[i];
     const progress = 5 + Math.round((30 * (i + 1)) / segments.length);
-    setStatus(job.id, "processing", `Whisper 전사 중 (분할 ${i + 1}/${segments.length})`, progress);
+    setStatus(job.id, "processing", "Whisper 전사 중", progress, `분할 ${i + 1}/${segments.length}`);
     const result = await transcribeChunkWithAutoRetry(
       apiKey,
       job.id,
@@ -417,7 +458,7 @@ async function transcribeAudio(job) {
     "INFO",
     `transcription completed with ${segments.length} chunks · timestamp aligned entries: ${combinedSegments.length}`
   );
-  setStatus(job.id, "processing", "요약으로 텍스트 정리", 35);
+  setStatus(job.id, "processing", "요약으로 텍스트 정리", 35, "분할 전사 병합");
   job.output.transcriptAligned = combinedSegments;
   return mergedText;
 }
@@ -696,7 +737,13 @@ async function summarizeTranscript(job, transcriptText) {
   const chunks = chunkForSummary(transcriptText, 28000, 7000);
   const mapResults = [];
   for (let index = 0; index < chunks.length; index++) {
-    setStatus(job.id, "processing", `요약 중 (map ${index + 1}/${chunks.length})`, 45 + Math.round((35 * (index + 1)) / (chunks.length * 2)));
+    setStatus(
+      job.id,
+      "processing",
+      "요약 중",
+      45 + Math.round((35 * (index + 1)) / (chunks.length * 2)),
+      `map ${index + 1}/${chunks.length}`
+    );
     const prompt = `Seminar date: ${job.seminarDate}\nDesired language: ${safeLang}\n\nChunk ${index + 1}/${chunks.length}\n\n${chunks[index]}`;
     const result = await callResponsesWithModelFallback(
       apiKey,
@@ -890,7 +937,7 @@ function extractOutputText(payload) {
 }
 
 async function renderReportPdf(job, report, presetId = "classic") {
-  setStatus(job.id, "processing", "PDF 렌더링", 80);
+  setStatus(job.id, "processing", "PDF 렌더링", 80, "페이지/레코드 배치");
   const { jsPDF } = window.jspdf;
   const preset = getOutputPreset(presetId);
   const style = preset.pdf;
@@ -962,7 +1009,7 @@ async function renderReportPdf(job, report, presetId = "classic") {
   const blob = new Blob([doc.output("arraybuffer")], { type: "application/pdf" });
   const url = URL.createObjectURL(blob);
   logJob(job.id, "INFO", `pdf generated (${pageCount} page)`);
-  setStatus(job.id, "processing", "완료", 100);
+  setStatus(job.id, "processing", "완료", 100, "저장 완료");
   return {
     url,
     mime: "application/pdf",
@@ -1080,7 +1127,7 @@ function startLiveTicker() {
     if (job.status === "processing") {
       const target = Number.isFinite(job.progressTarget) ? Number(job.progressTarget) : Number(job.progress || 0);
       const gap = target - job.progress;
-      const step = 0.32;
+      const step = Math.min(3, 0.2 + Math.abs(gap) * 0.18);
 
       if (Math.abs(gap) > 0.06) {
         job.progress += Math.sign(gap) * Math.min(Math.abs(gap), step);
@@ -1094,7 +1141,9 @@ function startLiveTicker() {
     liveProgress.style.width = `${job.progress}%`;
     const queuePos = queuePosition(job.id);
     const qtxt = queuePos ? `현재 대기순위: ${queuePos}` : "실시간 처리 중";
-    liveMeta.textContent = `상태: ${job.stage} · 진행률: ${job.progress.toFixed(1)}% · ${qtxt} · ${formatBytes(job.file.size)} · ${job.createdAt}`;
+    const hasInlineDetail = typeof job.stage === "string" && job.stage.includes("(") && job.stage.includes(")");
+    const liveDetail = !hasInlineDetail && job.progressDetail ? ` (${job.progressDetail})` : "";
+    liveMeta.textContent = `상태: ${job.stage}${liveDetail} · 진행률: ${job.progress.toFixed(1)}% · ${qtxt} · ${formatBytes(job.file.size)} · ${job.createdAt}`;
     renderLiveConsole();
   }, POLL_MS);
 }
@@ -1115,7 +1164,7 @@ function renderLiveConsole() {
     liveConsole.textContent = "작업을 찾을 수 없습니다.";
     return;
   }
-  renderLogTimeline(liveConsole, job.logs.slice(-120), "console-empty");
+  renderLogTimeline(liveConsole, job.logs.slice(-220), "console-empty");
   liveConsole.scrollTop = liveConsole.scrollHeight;
 }
 
@@ -1144,7 +1193,9 @@ function renderJobs() {
     const meta = document.createElement("div");
     meta.className = "muted";
     const preset = getOutputPreset(job.outputPresetId);
-    meta.textContent = `${job.studentId} · ${job.fileName} · ${formatBytes(job.file.size)} · 출력: ${preset.label} · ${job.stage}`;
+    const stageHasInlineDetail = typeof job.stage === "string" && job.stage.includes("(") && job.stage.includes(")");
+    const stageText = job.progressDetail && !stageHasInlineDetail ? `${job.stage} (${job.progressDetail})` : job.stage;
+    meta.textContent = `${job.studentId} · ${job.fileName} · ${formatBytes(job.file.size)} · 출력: ${preset.label} · ${stageText}`;
     card.appendChild(meta);
 
     const track = document.createElement("div");
@@ -1192,9 +1243,7 @@ function renderJobs() {
     card.appendChild(actions);
 
     const log = document.createElement("div");
-    log.className = "console console-timeline";
-    log.style.minHeight = "72px";
-    renderLogTimeline(log, job.logs.slice(-8), "console-empty");
+    renderJobLogSummary(log, job.logs, 3);
     card.appendChild(log);
 
     jobsList.appendChild(card);

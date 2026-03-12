@@ -188,6 +188,14 @@ async function onSubmit(event) {
     formError.textContent = "오디오/비디오 MIME 타입이 확인되지 않습니다. 다른 파일을 선택해 주세요.";
     return;
   }
+  if (file.size > STT_MAX_FILE_SIZE) {
+    const decodable = await canDecodeInBrowser(file);
+    if (!decodable) {
+      formError.textContent =
+        "브라우저에서 이 파일 코덱을 디코딩하지 못합니다. 25MB 이하 파일이거나 WAV/MP3로 변환한 파일을 업로드해 주세요.";
+      return;
+    }
+  }
 
   const job = {
     id: `job_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
@@ -217,6 +225,21 @@ async function onSubmit(event) {
   logJob(job.id, "INFO", "submit: queued");
   if (!appState.activeJobId) {
     void processQueue();
+  }
+}
+
+async function canDecodeInBrowser(file) {
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx || !file) return false;
+  const audioCtx = new AudioCtx();
+  try {
+    const raw = await file.arrayBuffer();
+    await audioCtx.decodeAudioData(raw.slice(0));
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    await audioCtx.close().catch(() => {});
   }
 }
 
@@ -453,9 +476,19 @@ async function transcribeAudio(job) {
   if (job.file.size <= STT_MAX_FILE_SIZE) {
     logJob(job.id, "INFO", `single pass 전사 시작: ${formatBytes(job.file.size)} (임계값 ${formatBytes(STT_MAX_FILE_SIZE)})`);
     const single = await transcribeChunkWithAutoRetry(apiKey, job.id, job.file, 0, STT_SEGMENT_BYTES);
+    const singleText = String(single?.text || "").trim();
+    const singleSegments = Array.isArray(single?.segments) ? single.segments : [];
+    const restoredSingleText = singleText || singleSegments.map((s) => String(s?.text || "").trim()).filter(Boolean).join(" ").trim();
+    if (!restoredSingleText) {
+      throw new Error(`transcription failed: empty single-pass transcript (segments=${singleSegments.length})`);
+    }
+    if (!singleText && restoredSingleText) {
+      logJob(job.id, "WARN", `single pass text가 비어 segments 기반으로 복구했습니다. (segments=${singleSegments.length})`);
+    }
+    job.output.transcriptAligned = singleSegments;
     logJob(job.id, "INFO", "transcription completed without split");
     setStatus(job.id, "processing", "요약으로 텍스트 정리", 35, "단일 청크 완결");
-    return single.text;
+    return restoredSingleText;
   }
 
   logJob(
@@ -463,7 +496,18 @@ async function transcribeAudio(job) {
     "INFO",
     `파일 크기 ${Math.round(job.file.size / (1024 * 1024))}MB: STT 분할 모드로 처리합니다. (기준 ${Math.round(STT_MAX_FILE_SIZE / (1024 * 1024))}MB)`
   );
-  const segments = await splitAudioForStt(job.file, STT_SEGMENT_BYTES, STT_CHUNK_SECONDS, STT_CHUNK_OVERLAP_SECONDS);
+  let segments = [];
+  try {
+    segments = await splitAudioForStt(job.file, STT_SEGMENT_BYTES, STT_CHUNK_SECONDS, STT_CHUNK_OVERLAP_SECONDS);
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (/오디오 디코딩 실패|decode audio/i.test(message)) {
+      throw new Error(
+        "브라우저에서 이 오디오 코덱을 디코딩하지 못해 분할 전사를 진행할 수 없습니다. WAV/MP3로 변환 후 재시도하거나 25MB 이하 파일로 업로드해 주세요."
+      );
+    }
+    throw error;
+  }
   if (!segments.length) {
     throw new Error("Failed to split audio into valid chunks");
   }
@@ -734,6 +778,9 @@ function extractTranscriptFromPayload(payload, timeOffsetSec = 0) {
   if (segments.length > 0 && text) {
     return { text, segments };
   }
+  if (text) {
+    return { text, segments: [{ start: startOffset, end: startOffset, text }] };
+  }
   if (Array.isArray(payload.segments)) {
     return {
       text: payload.segments
@@ -985,11 +1032,25 @@ function encodeWavFromAudioBuffer(audioBuffer) {
 
 async function summarizeTranscript(job, transcriptText) {
   const apiKey = String(job.apiKey || "").trim();
-  if (!transcriptText || !apiKey) throw new Error("No transcript text");
+  let effectiveTranscript = String(transcriptText || "").trim();
+  if (!effectiveTranscript) {
+    const aligned = Array.isArray(job?.output?.transcriptAligned) ? job.output.transcriptAligned : [];
+    if (aligned.length > 0) {
+      effectiveTranscript = aligned
+        .map((segment) => String(segment?.text || "").trim())
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+      if (effectiveTranscript) {
+        logJob(job.id, "WARN", `요약 진입 시 transcript 비어 aligned segments 기반으로 복구했습니다. (segments=${aligned.length})`);
+      }
+    }
+  }
+  if (!effectiveTranscript || !apiKey) throw new Error("No transcript text");
 
   const language = "en";
   const safeLang = language === "ko" ? "Korean" : "English";
-  const tokenEstimate = Math.max(1, Math.round(transcriptText.length / 3));
+  const tokenEstimate = Math.max(1, Math.round(effectiveTranscript.length / 3));
 
   if (tokenEstimate <= 300_000) {
     const result = await callResponsesWithModelFallback(
@@ -1002,13 +1063,13 @@ async function summarizeTranscript(job, transcriptText) {
         strict: true,
       },
       buildReportDeveloperPrompt(language),
-      buildSinglePassPrompt(transcriptText, job, language),
+      buildSinglePassPrompt(effectiveTranscript, job, language),
       2500
     );
     return result.payload;
   }
 
-  const chunks = chunkForSummary(transcriptText, 28000, 7000);
+  const chunks = chunkForSummary(effectiveTranscript, 28000, 7000);
   const mapResults = [];
   for (let index = 0; index < chunks.length; index++) {
     setStatus(
@@ -1154,6 +1215,16 @@ async function callResponsesWithModelFallback(apiKey, schemaName, schemaConfig, 
 }
 
 async function callOpenAIResponses(apiKey, model, schemaName, schemaConfig, developerPrompt, userPrompt, maxOutputTokens) {
+  const normalizedSchema = schemaConfig && typeof schemaConfig === "object" && schemaConfig.schema
+    ? schemaConfig.schema
+    : schemaConfig;
+  const normalizedSchemaName = schemaConfig && typeof schemaConfig === "object" && schemaConfig.name
+    ? schemaConfig.name
+    : schemaName;
+  const normalizedStrict = schemaConfig && typeof schemaConfig === "object" && typeof schemaConfig.strict === "boolean"
+    ? schemaConfig.strict
+    : true;
+
   const payload = {
     model,
     input: [
@@ -1169,8 +1240,9 @@ async function callOpenAIResponses(apiKey, model, schemaName, schemaConfig, deve
     text: {
       format: {
         type: "json_schema",
-        name: schemaName,
-        schema: schemaConfig,
+        name: normalizedSchemaName,
+        schema: normalizedSchema,
+        strict: normalizedStrict,
       },
     },
     max_output_tokens: maxOutputTokens,

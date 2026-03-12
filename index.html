@@ -56,7 +56,7 @@
                 accept=".m4a,.mp3,.wav,.ogg,.flac,.aac,.opus,.webm,.mp4,.mov,.m4v,.avi,.mkv,.3gp,.wma,.oga,.ogv,.mp4a"
                 required
               />
-              <small>지원 확장자: m4a, mp3, wav, ogg, flac, aac, opus, webm, mp4, mov, m4v 등. 25MB 초과는 자동 분할, 50MB 초과는 업로드 제한입니다.</small>
+              <small>지원 확장자: m4a, mp3, wav, ogg, flac, aac, opus, webm, mp4, mov, m4v 등. 25MB 초과는 자동 분할, 50MB 초과는 업로드 제한입니다. 일부 m4a 코덱은 브라우저 분할 전사에서 디코딩 실패할 수 있어, 대용량 파일은 WAV/MP3를 권장합니다.</small>
             </label>
           <div class="actions">
             <button type="submit" id="submit-btn">업로드 및 처리 시작</button>
@@ -93,6 +93,6 @@
     </main>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-    <script type="module" src="./app.js?v=20260313-4"></script>
+    <script type="module" src="./app.js?v=20260313-9"></script>
   </body>
 </html>

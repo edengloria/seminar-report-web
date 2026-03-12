@@ -475,6 +475,7 @@ async function transcribeAudio(job) {
 
   const combinedTextParts = [];
   const combinedSegments = [];
+  let emptyTextChunks = 0;
 
   for (let i = 0; i < segments.length; i++) {
     const segment = segments[i];
@@ -487,8 +488,11 @@ async function transcribeAudio(job) {
       segment.startTimeSec,
       STT_SEGMENT_BYTES
     );
-    if (result.text) {
-      combinedTextParts.push(result.text);
+    const chunkText = String(result.text || "").trim();
+    if (chunkText) {
+      combinedTextParts.push(chunkText);
+    } else {
+      emptyTextChunks += 1;
     }
     if (Array.isArray(result.segments) && result.segments.length > 0) {
       combinedSegments.push(...result.segments);
@@ -502,20 +506,31 @@ async function transcribeAudio(job) {
     logJob(job.id, "INFO", `transcribe segment ${i + 1}/${segments.length} done`);
   }
 
-  const mergedText = combinedTextParts.join("\n").trim();
+  let mergedText = combinedTextParts.join("\n").trim();
+  if (!mergedText && combinedSegments.length > 0) {
+    mergedText = combinedSegments
+      .map((segment) => String(segment?.text || "").trim())
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+    if (mergedText) {
+      logJob(job.id, "WARN", `전사 본문 텍스트가 비어 segments 기반으로 병합 복구했습니다. (empty chunks ${emptyTextChunks}/${segments.length})`);
+    }
+  }
   if (!mergedText) {
-    throw new Error("transcription failed");
+    throw new Error(`transcription failed: empty transcript (chunks=${segments.length}, emptyTextChunks=${emptyTextChunks}, aligned=${combinedSegments.length})`);
   }
 
-  const dedupText = dedupeTranscriptText(mergedText);
+  const dedupText = dedupeTranscriptText(mergedText) || mergedText;
   const dedupSegments = dedupeAlignedSegments(combinedSegments);
+  const finalSegments = dedupSegments.length > 0 ? dedupSegments : combinedSegments;
   logJob(
     job.id,
     "INFO",
-    `transcription completed with ${segments.length} chunks · segments in: ${combinedSegments.length} → ${dedupSegments.length}`
+    `transcription completed with ${segments.length} chunks · empty text chunks ${emptyTextChunks}/${segments.length} · segments in: ${combinedSegments.length} → ${finalSegments.length}`
   );
   setStatus(job.id, "processing", "요약으로 텍스트 정리", 35, "분할 전사 병합");
-  job.output.transcriptAligned = dedupSegments;
+  job.output.transcriptAligned = finalSegments;
   return dedupText;
 }
 

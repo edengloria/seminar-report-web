@@ -191,6 +191,7 @@ async function onSubmit(event) {
     file,
     status: "queued",
     progress: 0,
+    progressTarget: 0,
     stage: "대기 중",
     logs: [makeLog("INFO", "job created")],
     createdAt: new Date().toISOString(),
@@ -209,6 +210,64 @@ async function onSubmit(event) {
 
 function makeLog(level, message) {
   return `${new Date().toLocaleTimeString()} [${level}] ${message}`;
+}
+
+function parseLogLine(line) {
+  const safe = String(line || "");
+  const match = safe.match(/^(.+?)\s*\[([^\]]+)\]\s*(.*)$/);
+  if (!match) {
+    return {
+      time: "",
+      level: "INFO",
+      message: safe,
+    };
+  }
+  return {
+    time: match[1],
+    level: String(match[2] || "INFO").toLowerCase(),
+    message: match[3] || "",
+  };
+}
+
+function renderLogTimeline(container, lines, defaultClass = "console-empty") {
+  container.innerHTML = "";
+  container.classList.remove("console-empty");
+  container.classList.add("console");
+  container.classList.add("console-timeline");
+
+  if (!Array.isArray(lines) || lines.length === 0) {
+    container.textContent = "로그가 아직 없습니다.";
+    if (defaultClass) {
+      container.classList.add(defaultClass);
+    }
+    return;
+  }
+
+  const list = document.createElement("div");
+  for (const line of lines) {
+    const parsed = parseLogLine(line);
+    const row = document.createElement("div");
+    row.className = "log-item";
+
+    const time = document.createElement("div");
+    time.className = "log-item-time";
+    time.textContent = parsed.time;
+
+    const level = document.createElement("div");
+    const levelClass = parsed.level.toLowerCase();
+    level.className = `log-item-level ${["warn", "error", "info"].includes(levelClass) ? levelClass : ""}`;
+    level.textContent = parsed.level.toUpperCase();
+
+    const message = document.createElement("div");
+    message.className = "log-item-message";
+    message.textContent = parsed.message;
+
+    row.appendChild(time);
+    row.appendChild(level);
+    row.appendChild(message);
+    list.appendChild(row);
+  }
+  container.appendChild(list);
 }
 
 function logJob(jobId, level, message) {
@@ -239,21 +298,14 @@ function queuePosition(jobId) {
   return idx === -1 ? null : idx + 1;
 }
 
-function estimatedRemainingSeconds(job) {
-  if (job.status !== "processing") return 0;
-  if (!job.startedAt || job.progress <= 0) {
-    return 0;
-  }
-  const elapsedSec = (Date.now() - new Date(job.startedAt).getTime()) / 1000;
-  return Math.max(0, Math.round(elapsedSec * (100 - job.progress) / Math.max(job.progress, 1)));
-}
-
 function setStatus(jobId, status, stage, progress) {
   const job = appState.jobs.find((j) => j.id === jobId);
   if (!job) return;
   job.status = status;
   if (typeof stage === "string") job.stage = stage;
-  if (typeof progress === "number") job.progress = progress;
+  if (typeof progress === "number") {
+    job.progressTarget = Math.max(0, Math.min(100, progress));
+  }
   if (status === "processing" && !job.startedAt) {
     job.startedAt = new Date().toISOString();
   }
@@ -1025,36 +1077,45 @@ function startLiveTicker() {
     const job = appState.jobs.find((j) => j.id === appState.activeJobId);
     if (!job) return;
 
-    let progress = job.progress;
-    const remaining = estimatedRemainingSeconds(job);
+    if (job.status === "processing") {
+      const target = Number.isFinite(job.progressTarget) ? Number(job.progressTarget) : Number(job.progress || 0);
+      const gap = target - job.progress;
+      const step = 0.32;
 
-    if (job.status === "processing" && progress < 100) {
-      if (progress < 5) progress = Math.min(5, progress + 0.3);
-      if (progress >= 45 && progress < 78) progress = Math.min(78, progress + 0.5);
-      if (progress >= 78 && progress < 96) progress = Math.min(96, progress + 0.7);
-      job.progress = Number(progress.toFixed(1));
+      if (Math.abs(gap) > 0.06) {
+        job.progress += Math.sign(gap) * Math.min(Math.abs(gap), step);
+      } else if (job.progress < Math.min(target, 96)) {
+        job.progress = Math.min(96, job.progress + 0.05);
+      }
+      job.progress = Number(job.progress.toFixed(1));
     }
 
     liveTitle.textContent = `실행 중: ${job.studentName} (${job.fileName})`;
     liveProgress.style.width = `${job.progress}%`;
     const queuePos = queuePosition(job.id);
     const qtxt = queuePos ? `현재 대기순위: ${queuePos}` : "실시간 처리 중";
-    liveMeta.textContent = `상태: ${job.stage} · 진행률: ${job.progress.toFixed(1)}% · 추정 잔여: ${remaining > 0 ? `${remaining}초` : "확인중"} · ${qtxt} · ${formatBytes(job.file.size)} · ${job.createdAt}`;
+    liveMeta.textContent = `상태: ${job.stage} · 진행률: ${job.progress.toFixed(1)}% · ${qtxt} · ${formatBytes(job.file.size)} · ${job.createdAt}`;
     renderLiveConsole();
   }, POLL_MS);
 }
 
 function renderLiveConsole() {
   if (!appState.activeJobId) {
+    liveConsole.innerHTML = "";
+    renderLogTimeline(liveConsole, [], "console-empty");
     liveConsole.textContent = "처리 중인 작업 없음";
+    liveConsole.classList.remove("console-empty");
+    liveConsole.classList.add("console-empty");
     return;
   }
   const job = appState.jobs.find((j) => j.id === appState.activeJobId);
   if (!job) {
+    liveConsole.innerHTML = "";
+    renderLogTimeline(liveConsole, [], "console-empty");
     liveConsole.textContent = "작업을 찾을 수 없습니다.";
     return;
   }
-  liveConsole.textContent = job.logs.slice(-120).map((l) => `> ${l}`).join("\n");
+  renderLogTimeline(liveConsole, job.logs.slice(-120), "console-empty");
   liveConsole.scrollTop = liveConsole.scrollHeight;
 }
 
@@ -1072,8 +1133,6 @@ function renderJobs() {
     const pos = queuePosition(job.id);
     const rankText = pos ? `· 대기순위 ${pos}` : "";
     const statusClass = `job-${job.status}`;
-    const eta = estimatedRemainingSeconds(job);
-
     const card = document.createElement("div");
     card.className = "job";
 
@@ -1098,12 +1157,12 @@ function renderJobs() {
 
     const etaText = document.createElement("div");
     etaText.className = "muted";
-    etaText.textContent = job.status === "processing"
-      ? `추정 잔여 시간: ${eta ? `${eta}초` : "-"}`
-      : job.status === "done"
+    etaText.textContent = job.status === "done"
       ? "완료"
       : job.status === "error"
       ? `오류: ${job.error || "알 수 없음"}`
+      : job.status === "processing"
+      ? `진행률 ${Math.min(100, Math.max(0, job.progress)).toFixed(1)}%`
       : pos
       ? `현재 대기열: ${appState.jobs.filter((j) => j.status === "queued").length}개`
       : "-";
@@ -1132,10 +1191,10 @@ function renderJobs() {
 
     card.appendChild(actions);
 
-    const log = document.createElement("pre");
-    log.className = "console";
+    const log = document.createElement("div");
+    log.className = "console console-timeline";
     log.style.minHeight = "72px";
-    log.textContent = job.logs.slice(-8).join("\n");
+    renderLogTimeline(log, job.logs.slice(-8), "console-empty");
     card.appendChild(log);
 
     jobsList.appendChild(card);

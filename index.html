@@ -8,22 +8,26 @@
   </head>
   <body>
     <main class="container">
-      <header>
-        <h1>Seminar Report Generator</h1>
-        <p class="muted">클라이언트에서 OpenAI API 키를 입력 받아 처리하고, 결과 PDF를 즉시 내려받을 수 있습니다.</p>
+      <header class="hero">
+        <p class="eyebrow muted">Seminar Report Generator</p>
+        <h1>Seminar Report Workflow</h1>
+        <p class="hero-copy muted">녹음 파일을 업로드하면 전사·요약·PDF/Markdown 생성까지 한 번에 처리합니다.</p>
       </header>
 
       <section class="card">
-        <h2>1) 작업 제출</h2>
+        <div class="section-header">
+          <span class="section-badge" aria-hidden="true">1</span>
+          <h2>작업 제출</h2>
+        </div>
         <form id="submit-form">
           <div class="grid two-col">
             <label>
               이름
-              <input id="student-name" required placeholder="홍길동" />
+              <input id="student-name" required placeholder="예: 홍길동" />
             </label>
             <label>
               학번
-              <input id="student-id" required placeholder="2026012345" />
+              <input id="student-id" required placeholder="예: 2026012345" />
             </label>
             <label>
               세미나 날짜
@@ -32,16 +36,16 @@
             <label>
               OpenAI API Key
               <input id="openai-key" type="password" required placeholder="sk-..." autocomplete="off" />
-              <small>⚠️ 키는 코드나 저장소에 절대 저장되지 않으며, 브라우저 메모리에만 유지됩니다.</small>
+              <small>키는 브라우저 메모리에만 저장되며, 코드/저장소에 기록되지 않습니다.</small>
             </label>
             <label>
               출력 프리셋
               <select id="output-preset">
-                <option value="classic" selected>클래식 · 기본(명확한 항목 구분)</option>
-                <option value="compact">컴팩트 · 요약형(짧고 조밀)</option>
-                <option value="academic">아카데믹 · 정식 보고서형(타임라인+주석)</option>
+                <option value="classic" selected>클래식 · 명확한 항목 구분</option>
+                <option value="compact">컴팩트 · 짧고 조밀한 형태</option>
+                <option value="academic">아카데믹 · 보고서 톤</option>
               </select>
-              <small>선택한 프리셋은 Markdown/PDF 양쪽 레이아웃에 동시에 반영됩니다.</small>
+              <small>선택한 프리셋은 Markdown/PDF 양쪽에 동시에 적용됩니다.</small>
             </label>
           </div>
             <label>
@@ -52,11 +56,11 @@
                 accept=".m4a,.mp3,.wav,.ogg,.flac,.aac,.opus,.webm,.mp4,.mov,.m4v,.avi,.mkv,.3gp,.wma,.oga,.ogv,.mp4a"
                 required
               />
-              <small>지원 확장자: m4a, mp3, wav, ogg, flac, aac, opus, webm, mp4, mov, m4v 등. 25MB 초과 파일은 자동 분할 후 처리, 50MB 초과는 업로드 제한입니다.</small>
+              <small>지원 확장자: m4a, mp3, wav, ogg, flac, aac, opus, webm, mp4, mov, m4v 등. 25MB 초과는 자동 분할, 50MB 초과는 업로드 제한입니다.</small>
             </label>
           <div class="actions">
             <button type="submit" id="submit-btn">업로드 및 처리 시작</button>
-            <button type="button" id="clear-form-btn">입력값 초기화</button>
+            <button type="button" id="clear-form-btn">입력 초기화</button>
           </div>
         </form>
         <p id="form-error" class="error"></p>
@@ -64,12 +68,18 @@
 
       <section class="layout">
         <article class="card">
-          <h2>2) 진행 상태</h2>
+          <div class="section-header">
+            <span class="section-badge" aria-hidden="true">2</span>
+            <h2>진행 상태</h2>
+          </div>
           <div id="jobs-list" class="jobs"></div>
         </article>
 
         <article class="card">
-          <h2>3) 실시간 모니터</h2>
+          <div class="section-header">
+            <span class="section-badge" aria-hidden="true">3</span>
+            <h2>실시간 모니터</h2>
+          </div>
           <div id="live-title" class="muted">실행 중인 job이 없습니다.</div>
           <div class="progress-wrap">
             <div class="progress-track">
@@ -77,7 +87,7 @@
             </div>
             <div id="live-meta" class="muted"></div>
           </div>
-          <pre id="live-console" class="console"></pre>
+          <div id="live-console" class="console console-timeline"></div>
         </article>
       </section>
     </main>

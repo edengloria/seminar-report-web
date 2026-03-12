@@ -4,6 +4,8 @@ const MAX_FILE_SIZE = 50 * 1024 * 1024;
 const STT_MAX_FILE_SIZE = 25 * 1024 * 1024;
 const STT_SEGMENT_BYTES = 18 * 1024 * 1024;
 const STT_MIN_SEGMENT_BYTES = 4 * 1024 * 1024;
+const STT_CHUNK_SECONDS = 180;
+const STT_CHUNK_OVERLAP_SECONDS = 12;
 const POLL_MS = 1000;
 const TRANSCRIBE_REQUEST_TIMEOUT_MS = 7 * 60 * 1000;
 const TRANSCRIBE_RETRY_LIMIT = 3;
@@ -442,11 +444,11 @@ async function transcribeAudio(job) {
     "INFO",
     `파일 크기 ${Math.round(job.file.size / (1024 * 1024))}MB: STT 분할 모드로 처리합니다. (기준 ${Math.round(STT_MAX_FILE_SIZE / (1024 * 1024))}MB)`
   );
-  const segments = await splitAudioForStt(job.file, STT_SEGMENT_BYTES);
+  const segments = await splitAudioForStt(job.file, STT_SEGMENT_BYTES, STT_CHUNK_SECONDS, STT_CHUNK_OVERLAP_SECONDS);
   if (!segments.length) {
     throw new Error("Failed to split audio into valid chunks");
   }
-  logJob(job.id, "INFO", `초기 오디오 분할 완료: ${segments.length}개 조각`);
+  logJob(job.id, "INFO", `초기 오디오 분할 완료: ${segments.length}개 조각 (타임윈도우 ${STT_CHUNK_SECONDS}초, 오버랩 ${STT_CHUNK_OVERLAP_SECONDS}초)`);
 
   const combinedTextParts = [];
   const combinedSegments = [];
@@ -482,14 +484,16 @@ async function transcribeAudio(job) {
     throw new Error("transcription failed");
   }
 
+  const dedupText = dedupeTranscriptText(mergedText);
+  const dedupSegments = dedupeAlignedSegments(combinedSegments);
   logJob(
     job.id,
     "INFO",
-    `transcription completed with ${segments.length} chunks · timestamp aligned entries: ${combinedSegments.length}`
+    `transcription completed with ${segments.length} chunks · segments in: ${combinedSegments.length} → ${dedupSegments.length}`
   );
   setStatus(job.id, "processing", "요약으로 텍스트 정리", 35, "분할 전사 병합");
-  job.output.transcriptAligned = combinedSegments;
-  return mergedText;
+  job.output.transcriptAligned = dedupSegments;
+  return dedupText;
 }
 
 async function transcribeSingleFile(file, apiKey, timeOffsetSec = 0) {
@@ -730,7 +734,69 @@ function extractTranscriptFromPayload(payload, timeOffsetSec = 0) {
   return { text: "", segments: [] };
 }
 
-async function splitAudioForStt(file, targetBytes) {
+function normalizeTranscriptText(value) {
+  return String(value || "").toLowerCase().replace(/\s+/g, " ").replace(/[^0-9a-z가-힣ㄱ-ㅎㅏ-ㅣ\s]/g, "").trim();
+}
+
+function splitToSentences(text) {
+  return String(text || "")
+    .replace(/\r\n/g, "\n")
+    .split(/\n+|(?<=[.!?])\s+/g)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+function dedupeTranscriptText(text) {
+  const sentences = splitToSentences(text);
+  const seen = new Set();
+  const output = [];
+
+  for (const sentence of sentences) {
+    const normalized = normalizeTranscriptText(sentence);
+    if (!normalized) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    output.push(sentence);
+  }
+
+  return output.join(" ").trim();
+}
+
+function dedupeAlignedSegments(segments) {
+  if (!Array.isArray(segments)) return [];
+  const sorted = [...segments].sort((a, b) => Number(a.start || 0) - Number(b.start || 0));
+  const deduped = [];
+  const seen = [];
+
+  for (const segment of sorted) {
+    const text = String(segment?.text || "").trim();
+    if (!text) continue;
+    const normalized = normalizeTranscriptText(text).slice(0, 160);
+    if (!normalized) continue;
+
+    const isDuplicate = seen.some((entry) => {
+      if (!entry.normalized.length || !normalized.length) return false;
+      return entry.normalized.includes(normalized) || normalized.includes(entry.normalized);
+    });
+    if (isDuplicate) continue;
+
+    seen.push({
+      normalized,
+      start: Number(segment.start || 0),
+      end: Number(segment.end || segment.start || 0),
+      text,
+    });
+    deduped.push({
+      start: Number(segment.start || 0),
+      end: Number(segment.end || segment.start || 0),
+      text,
+    });
+  }
+
+  return deduped;
+}
+
+async function splitAudioForStt(file, targetBytes, targetSeconds = STT_CHUNK_SECONDS, overlapSeconds = STT_CHUNK_OVERLAP_SECONDS) {
   const fileData = await file.arrayBuffer();
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
   if (!AudioCtx) throw new Error("브라우저에서 AudioContext를 지원하지 않습니다.");
@@ -748,20 +814,29 @@ async function splitAudioForStt(file, targetBytes) {
     const channels = decoded.numberOfChannels;
     const sampleRate = decoded.sampleRate;
     const totalSamples = decoded.length;
-    const minChunkCountByFileSize = Math.max(1, Math.ceil(file.size / STT_MAX_FILE_SIZE));
     const maxSamplesBySize = Math.max(
       1,
       Math.floor((sampleRate * Math.max(targetBytes - 44, 0)) / Math.max(channels * 2, 1))
     );
-    const maxSamplesByFileSize = Math.floor(totalSamples / Math.max(1, minChunkCountByFileSize));
-    const maxSamplesPerChunk = Math.max(1, Math.min(maxSamplesBySize, maxSamplesByFileSize));
+    const maxSamplesByTime = Math.max(1, Math.floor(sampleRate * Math.max(1, targetSeconds)));
+    const maxSamplesPerChunk = Math.max(
+      1,
+      Math.min(maxSamplesBySize, maxSamplesByTime)
+    );
+    const overlapSamples = Math.max(
+      0,
+      Math.min(Math.floor(sampleRate * Math.max(0, overlapSeconds)), Math.max(0, maxSamplesPerChunk - 1))
+    );
+    const stepSamples = Math.max(1, maxSamplesPerChunk - overlapSamples);
     const chunks = [];
-    const projectedChunkCount = Math.max(1, Math.ceil(totalSamples / maxSamplesPerChunk));
+    const projectedChunkCount = Math.max(1, Math.ceil(totalSamples / stepSamples));
     const chunkLabel = `${(file.size / (1024 * 1024)).toFixed(1)}MB`;
     logJob(
       appState.activeJobId,
       "INFO",
-      `오디오 분할: ${chunkLabel} 소스 / 청크타입 ${Math.round(targetBytes / (1024 * 1024))}MB → ${projectedChunkCount}개 보장`
+      `오디오 분할: ${chunkLabel} / 청크 ${Math.round(targetBytes / (1024 * 1024))}MB, 타임윈도우 ${
+        Math.round(maxSamplesPerChunk / sampleRate)
+      }초, 오버랩 ${Math.round(overlapSamples / sampleRate)}초, 예상 ${projectedChunkCount}개`
     );
 
     let cursor = 0;
@@ -781,7 +856,7 @@ async function splitAudioForStt(file, targetBytes) {
         startTimeSec: cursor / sampleRate,
         endTimeSec: end / sampleRate,
       });
-      cursor = end;
+      cursor = Math.min(totalSamples, cursor + stepSamples);
     }
 
     return chunks;

@@ -1,7 +1,8 @@
 const STT_MODEL = "gpt-4o-transcribe";
-const SUMMARY_MODELS = ["gpt-5.2", "gpt-4o", "gpt-4o-mini"];
-const MAX_FILE_SIZE = 24 * 1024 * 1024;
+const SUMMARY_MODELS = ["gpt-4o", "gpt-4o-mini"];
+const MAX_FILE_SIZE = 25 * 1024 * 1024;
 const POLL_MS = 1000;
+const ALLOWED_EXTENSIONS = ["m4a", "mp3", "wav", "ogg", "flac", "aac", "opus", "webm", "mp4", "mov", "m4v", "avi", "mkv", "3gp", "oga", "ogv", "wma", "mp4a"];
 
 const reportSchema = {
   type: "object",
@@ -103,6 +104,16 @@ async function onSubmit(event) {
   }
   if (file.size > MAX_FILE_SIZE) {
     formError.textContent = `파일 크기가 너무 큽니다. (${Math.round(file.size / (1024 * 1024))}MB). OpenAI 오디오 API 권장 상한(약 25MB) 이내로 업로드하세요.`;
+    return;
+  }
+  const fileName = String(file.name || "").toLowerCase();
+  const ext = fileName.includes(".") ? fileName.split(".").pop() : "";
+  if (!ext || !ALLOWED_EXTENSIONS.includes(ext)) {
+    formError.textContent = `지원되지 않는 파일 형식입니다. 확장자 .${ext || "미확인"}은(는) 처리할 수 없습니다.`;
+    return;
+  }
+  if (file.type && !file.type.startsWith("audio/") && !file.type.startsWith("video/")) {
+    formError.textContent = "오디오/비디오 MIME 타입이 확인되지 않습니다. 다른 파일을 선택해 주세요.";
     return;
   }
 
@@ -258,20 +269,13 @@ async function transcribeAudio(job) {
         const body = await res.text();
         const err = new Error(`OpenAI audio API ${res.status}: ${body}`);
         lastError = err;
-        if (responseFormat === "text") throw err;
-        if (responseFormat === "json") {
-          try {
-            const txt = JSON.parse(body || "{}");
-            if (txt?.error?.code === "unsupported_value") throw err;
-          } catch {
-            // continue fallback to text when body is not parsed
-          }
+        if (!body.includes("unsupported") && !body.includes("unsupported_value")) {
+          throw err;
         }
-        if (responseFormat === "verbose_json") {
-          if (body.includes("unsupported_value")) continue;
-        }
-        if (responseFormat === "json") {
-          if (body.includes("unsupported_value")) continue;
+        // 특정 모델/포맷 조합 미지원 시 다음 포맷으로 fallback
+        if (responseFormat !== "text") {
+          logJob(job.id, "WARN", `${responseFormat} 포맷 미지원 또는 오류 -> fallback`);
+          continue;
         }
         throw err;
       }
@@ -453,22 +457,21 @@ function buildReduceDeveloperPrompt(language) {
 }
 
 function chunkForSummary(text, targetChars, overlap) {
-  const items = text.split(/(\s+)/).filter((x) => x.trim());
-  const chunks = [];
-  let current = [];
-  let currentLen = 0;
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return [""];
+  if (normalized.length <= targetChars) return [normalized];
 
-  for (let i = 0; i < items.length; i++) {
-    current.push(items[i]);
-    currentLen += items[i].length;
-    if (currentLen >= targetChars) {
-      chunks.push(current.join(" "));
-      const overlapText = current.slice(-Math.max(1, Math.floor(current.length * (overlap / Math.max(currentLen, 1) / 1))));
-      current = overlapText.slice();
-      currentLen = overlapText.reduce((acc, w) => acc + w.length, 0);
-    }
+  const chunks = [];
+  const step = Math.max(800, targetChars - overlap);
+  let start = 0;
+  const total = normalized.length;
+  while (start < total) {
+    const end = Math.min(total, start + targetChars);
+    const chunk = normalized.slice(start, end).trim();
+    if (chunk) chunks.push(chunk);
+    if (end >= total) break;
+    start = Math.max(0, end - overlap);
   }
-  if (current.length > 0) chunks.push(current.join(" "));
   return chunks;
 }
 
@@ -549,74 +552,66 @@ async function renderReportPdf(job, report) {
   const { jsPDF } = window.jspdf;
   const title = `[Seminar Report] (${job.seminarDate})`;
 
-  const candidates = [11, 10.5, 10, 9.2];
-  let best = null;
-  let bestPages = 999;
+  const doc = new jsPDF({ unit: "mm", format: "a4" });
+  doc.setFont("helvetica", "normal");
 
-  for (const fontSize of candidates) {
-    const doc = new jsPDF({ unit: "mm", format: "a4" });
-    doc.setFont("helvetica", "normal");
+  const margin = 14;
+  const maxWidth = 182;
+  const pageBottom = 285;
+  let y = 18;
 
-    let y = 18;
-    const margin = 14;
-    const maxWidth = 182;
-    const line = (txt, size = fontSize, leading = size + 2.3, style = "normal") => {
-      doc.setFontSize(size);
-      doc.setFont("helvetica", style);
-      const chunks = doc.splitTextToSize(String(txt), maxWidth);
-      doc.text(chunks, margin, y);
-      y += chunks.length * (leading * 0.3528);
-    };
-
-    line(title, 15, 20, "bold");
-    line(`${formatDateLabel(job.seminarDate)} ${job.studentName} (${job.studentId})`, 10, 14);
-    y += 2;
-
-    doc.setDrawColor(220);
-    doc.line(margin, y, margin + maxWidth, y);
-    y += 6;
-
-    line("1. Summary", 12, 14, "bold");
-    report.summary_sentences.forEach((sentence, index) => line(`${String.fromCharCode(65 + index)}. ${sentence}`, fontSize, fontSize + 2.8));
-    y += 3;
-
-    line("2. Learnings", 12, 14, "bold");
-    line(`A. ${report.learning_sentence}`, fontSize, fontSize + 2.8);
-    y += 3;
-
-    line("3. QnA", 12, 14, "bold");
-    report.qna.slice(0, 3).forEach((pair, index) => {
-      line(`${String.fromCharCode(65 + index)}. ${pair.question}`, fontSize, fontSize + 2.8);
-      line(`i. ${pair.answer}`, fontSize, fontSize + 2.8);
-      y += 1;
-    });
-
-    const pages = doc.getNumberOfPages();
-    if (pages === 1 && doc.internal.getCurrentPageInfo().pageNumber === 1) {
-      best = new Blob([doc.output("arraybuffer")], { type: "application/pdf" });
-      bestPages = 1;
-      break;
+  const ensureSpace = (lines, lineHeight) => {
+    const needed = lines * lineHeight;
+    if (y + needed > pageBottom) {
+      doc.addPage();
+      y = 18;
     }
+  };
 
-    if (pages < bestPages) {
-      bestPages = pages;
-      best = new Blob([doc.output("arraybuffer")], { type: "application/pdf" });
-    }
-  }
+  const line = (txt, size = 10.2, leading = size + 2.3, style = "normal") => {
+    doc.setFontSize(size);
+    doc.setFont("helvetica", style);
+    const chunks = doc.splitTextToSize(String(txt), maxWidth);
+    const rows = Array.isArray(chunks) ? chunks.length : 1;
+    ensureSpace(rows, leading);
+    doc.text(chunks, margin, y);
+    y += rows * (leading * 0.3528);
+  };
 
-  if (!best) {
-    throw new Error("PDF 생성 실패");
-  }
+  line(title, 15, 20, "bold");
+  line(`${formatDateLabel(job.seminarDate)} ${job.studentName} (${job.studentId})`, 10, 14);
+  y += 2;
 
-  const url = URL.createObjectURL(best);
-  logJob(job.id, "INFO", `pdf generated (${bestPages} page)`);
+  doc.setDrawColor(220);
+  doc.line(margin, y, margin + maxWidth, y);
+  y += 6;
+
+  line("1. Summary", 12, 14, "bold");
+  report.summary_sentences.forEach((sentence, index) => line(`${String.fromCharCode(65 + index)}. ${sentence}`));
+  y += 3;
+
+  line("2. Learnings", 12, 14, "bold");
+  line(`A. ${report.learning_sentence}`);
+  y += 3;
+
+  line("3. QnA", 12, 14, "bold");
+  (report.qna || []).slice(0, 3).forEach((pair, index) => {
+    line(`${String.fromCharCode(65 + index)}. ${pair.question || ""}`);
+    line(`i. ${pair.answer || ""}`);
+    y += 1;
+  });
+
+  const pageCount = doc.getNumberOfPages();
+  const blob = new Blob([doc.output("arraybuffer")], { type: "application/pdf" });
+  const url = URL.createObjectURL(blob);
+  logJob(job.id, "INFO", `pdf generated (${pageCount} page)`);
   setStatus(job.id, "processing", "완료", 100);
   return {
     url,
     mime: "application/pdf",
     createdAt: new Date().toISOString(),
     fileName: `seminar-report-${job.studentId}-${job.seminarDate}.pdf`,
-  };
+  }
 }
 
 function toMarkdownReport(job, report) {
@@ -650,7 +645,6 @@ function startLiveTicker() {
     if (!job) return;
 
     let progress = job.progress;
-    const elapsed = Math.max(0, Math.round((Date.now() - new Date(job.startedAt || Date.now()).getTime()) / 1000));
     const remaining = estimatedRemainingSeconds(job);
 
     if (job.status === "processing" && progress < 100) {

@@ -44,7 +44,30 @@ npx serve .
 2. GitHub `Settings -> Pages`에서 Source를 `GitHub Actions`로 설정
 3. `main` 브랜치 push 시 자동 배포
 
+권장 배포 순서:
+```bash
+git init
+git add .
+git commit -m "feat: add seminar report web app"
+git branch -M main
+git remote add origin https://github.com/<your-github-id>/<repo-name>.git
+git push -u origin main
+```
+
+배포 확인:
+```bash
+gh api repos/<your-github-id>/<repo-name>/pages | jq .html_url
+```
+
 ## 주의
 
 - 사용자 키는 브라우저에서 OpenAI로 직접 전송됩니다. 고수준 보안이 필요한 상용/대규모 다중 사용자 환경은
   별도 서버 또는 비밀 키 프록시가 필요합니다.
+
+## 현재 처리 파이프라인
+
+1. 오디오 업로드(브라우저)
+2. `gpt-4o-transcribe`로 음성 전사
+3. `Responses API`로 요약(JSON 스키마) + map/reduce 병렬 fallback
+4. jsPDF로 PDF 생성 후 다운로드 링크 노출
+5. Markdown도 동시에 생성해 선택 다운로드

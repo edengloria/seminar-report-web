@@ -2,9 +2,12 @@ const STT_MODEL = "gpt-4o-transcribe";
 const SUMMARY_MODELS = ["gpt-4o", "gpt-4o-mini"];
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
 const STT_MAX_FILE_SIZE = 25 * 1024 * 1024;
-const STT_SEGMENT_BYTES = 24 * 1024 * 1024;
-const STT_MIN_SEGMENT_BYTES = 6 * 1024 * 1024;
+const STT_SEGMENT_BYTES = 18 * 1024 * 1024;
+const STT_MIN_SEGMENT_BYTES = 4 * 1024 * 1024;
 const POLL_MS = 1000;
+const TRANSCRIBE_REQUEST_TIMEOUT_MS = 7 * 60 * 1000;
+const TRANSCRIBE_RETRY_LIMIT = 3;
+const STT_RETRY_INTERVAL_MS = 1200;
 const ALLOWED_EXTENSIONS = ["m4a", "mp3", "wav", "ogg", "flac", "aac", "opus", "webm", "mp4", "mov", "m4v", "avi", "mkv", "3gp", "oga", "ogv", "wma", "mp4a"];
 
 const reportSchema = {
@@ -199,6 +202,8 @@ async function onSubmit(event) {
     result: null,
     error: null,
     output: {},
+    lastLogAt: null,
+    stallNoticeAt: null,
   };
   appState.jobs.push(job);
   form.reset();
@@ -241,6 +246,20 @@ function parseLogLine(line) {
     level: String(match[2] || "INFO").toLowerCase(),
     message: match[3] || "",
   };
+}
+
+function withTimeout(promise, ms, label = "request") {
+  let timeoutId = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`));
+    }, ms);
+  });
+
+  return Promise.race([
+    promise.finally(() => clearTimeout(timeoutId)),
+    timeoutPromise,
+  ]);
 }
 
 function renderLogTimeline(container, lines, defaultClass = "console-empty") {
@@ -289,6 +308,8 @@ function logJob(jobId, level, message) {
   if (!job) return;
   job.logs.push(makeLog(level, message));
   if (job.logs.length > 200) job.logs.shift();
+  job.lastLogAt = Date.now();
+  job.stallNoticeAt = null;
   if (appState.activeJobId === jobId) {
     renderLiveConsole();
   }
@@ -320,6 +341,8 @@ function setStatus(jobId, status, stage, progress, detail) {
   if (typeof progress === "number") {
     job.progressTarget = Math.max(0, Math.min(100, progress));
   }
+  job.lastLogAt = Date.now();
+  job.stallNoticeAt = null;
   if (typeof detail !== "undefined") {
     job.progressDetail = String(detail || "").trim();
   }
@@ -407,17 +430,23 @@ async function transcribeAudio(job) {
   if (!apiKey) throw new Error("API key missing");
 
   if (job.file.size <= STT_MAX_FILE_SIZE) {
+    logJob(job.id, "INFO", `single pass 전사 시작: ${formatBytes(job.file.size)} (임계값 ${formatBytes(STT_MAX_FILE_SIZE)})`);
     const single = await transcribeChunkWithAutoRetry(apiKey, job.id, job.file, 0, STT_SEGMENT_BYTES);
     logJob(job.id, "INFO", "transcription completed without split");
     setStatus(job.id, "processing", "요약으로 텍스트 정리", 35, "단일 청크 완결");
     return single.text;
   }
 
-  logJob(job.id, "INFO", `파일 크기 ${Math.round(job.file.size / (1024 * 1024))}MB: STT 분할 모드로 처리합니다.`);
+  logJob(
+    job.id,
+    "INFO",
+    `파일 크기 ${Math.round(job.file.size / (1024 * 1024))}MB: STT 분할 모드로 처리합니다. (기준 ${Math.round(STT_MAX_FILE_SIZE / (1024 * 1024))}MB)`
+  );
   const segments = await splitAudioForStt(job.file, STT_SEGMENT_BYTES);
   if (!segments.length) {
     throw new Error("Failed to split audio into valid chunks");
   }
+  logJob(job.id, "INFO", `초기 오디오 분할 완료: ${segments.length}개 조각`);
 
   const combinedTextParts = [];
   const combinedSegments = [];
@@ -473,11 +502,15 @@ async function transcribeSingleFile(file, apiKey, timeOffsetSec = 0) {
       formData.append("file", file);
       formData.append("model", model);
       formData.append("response_format", responseFormat);
-      const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${apiKey}` },
-        body: formData,
-      });
+      const res = await withTimeout(
+        fetch("https://api.openai.com/v1/audio/transcriptions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${apiKey}` },
+          body: formData,
+        }),
+        TRANSCRIBE_REQUEST_TIMEOUT_MS,
+        "transcribe"
+      );
       if (!res.ok) {
         const body = await res.text();
         const err = new Error(`OpenAI audio API ${res.status}: ${body}`);
@@ -515,15 +548,51 @@ async function transcribeChunkWithAutoRetry(apiKey, jobId, file, timeOffsetSec =
   if (!file || !file.size) {
     throw new Error("audio chunk is empty");
   }
+  const job = appState.jobs.find((j) => j.id === jobId);
+  const jobLabel = file.size ? `(${Math.round(file.size / (1024 * 1024))}MB)` : "";
+  const chunkStart = Date.now();
   try {
+    const presetLabel = job ? ` [${job.outputPresetId || "N/A"}]` : "";
+    const attemptLabel = targetBytes ? ` target ${Math.round(targetBytes / (1024 * 1024))}MB` : "";
+    logJob(jobId, "INFO", `transcribe attempt${presetLabel} ${jobLabel}${attemptLabel}`);
     return await transcribeSingleFile(file, apiKey, timeOffsetSec);
   } catch (error) {
     const message = String(error?.message || error);
+    const detailSec = ((Date.now() - chunkStart) / 1000).toFixed(1);
+    if (message.includes("timed out")) {
+      if (job && !job.stallNoticeAt) {
+        job.stallNoticeAt = Date.now();
+        setStatus(jobId, "processing", "Whisper 전사 중", job.progressTarget || 35, "타임아웃 재시도");
+        logJob(jobId, "WARN", `transcribe timeout (${detailSec}s): ${message}`);
+      }
+      return withBackoffRetry(() => transcribeSingleFile(file, apiKey, timeOffsetSec), jobId, 1);
+    }
+    if (isTransientTranscribeError(message)) {
+      if (job) {
+        setStatus(jobId, "processing", "Whisper 전사 중", job.progressTarget || 35, `일시적 오류 재시도 (소요 ${detailSec}s)`);
+        logJob(jobId, "WARN", `transcribe temporary failure (${detailSec}s), retrying: ${message}`);
+      }
+      return withBackoffRetry(() => transcribeSingleFile(file, apiKey, timeOffsetSec), jobId, 1);
+    }
     if (!isOpenAITooLargeError(message) || targetBytes <= STT_MIN_SEGMENT_BYTES || file.size <= STT_MIN_SEGMENT_BYTES) {
       throw error;
     }
 
     const nextTarget = Math.max(STT_MIN_SEGMENT_BYTES, Math.floor(targetBytes * 0.7));
+    if (job) {
+      setStatus(
+        jobId,
+        "processing",
+        "Whisper 전사 중",
+        job.progressTarget || 35,
+        `재시도: 조각 ${Math.round(file.size / (1024 * 1024))}MB → ${Math.round(nextTarget / (1024 * 1024))}MB`
+      );
+      logJob(
+        jobId,
+        "WARN",
+        `transcribe chunk too large (${Math.round(file.size / (1024 * 1024))}MB): ${Math.round(targetBytes / (1024 * 1024))}MB -> ${Math.round(nextTarget / (1024 * 1024))}MB`
+      );
+    }
     logJob(jobId, "WARN", `세그먼트 분할 재시도: ${Math.round(targetBytes / (1024 * 1024))}MB -> ${Math.round(nextTarget / (1024 * 1024))}MB`);
     const chunks = await splitAudioForStt(file, nextTarget);
     if (!chunks.length) {
@@ -555,8 +624,52 @@ async function transcribeChunkWithAutoRetry(apiKey, jobId, file, timeOffsetSec =
   }
 }
 
+async function withBackoffRetry(fn, jobId, attempt = 1) {
+  if (attempt > TRANSCRIBE_RETRY_LIMIT) {
+    throw new Error("transcribe retries exceeded");
+  }
+
+  await sleep(STT_RETRY_INTERVAL_MS * attempt);
+  if (jobId && appState.activeJobId === jobId) {
+    const job = appState.jobs.find((j) => j.id === jobId);
+    if (job) {
+      setStatus(jobId, "processing", "Whisper 전사 중", job.progressTarget || 35, `재시도 ${attempt}/${TRANSCRIBE_RETRY_LIMIT}`);
+      logJob(jobId, "WARN", `transcribe 재시도 ${attempt}/${TRANSCRIBE_RETRY_LIMIT} 시작`);
+    }
+  }
+
+  try {
+    return await withTimeout(fn(), TRANSCRIBE_REQUEST_TIMEOUT_MS, "transcribe");
+  } catch (error) {
+    if (attempt >= TRANSCRIBE_RETRY_LIMIT) throw error;
+    if (jobId) {
+      const job = appState.jobs.find((j) => j.id === jobId);
+      setStatus(
+        jobId,
+        "processing",
+        "Whisper 전사 중",
+        job?.progressTarget || 35,
+        `재시도 ${attempt}/${TRANSCRIBE_RETRY_LIMIT}`
+      );
+    }
+    return withBackoffRetry(fn, jobId, attempt + 1);
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function isOpenAITooLargeError(message = "") {
-  return /25\s*MB|too\s+large|maximum\s+file\s+size|exceeds the maximum|권장\s*상한|413/i.test(message);
+  return /25\s*MB|too\s+large|maximum\s+file\s+size|file\s+size|max\s*size|exceeds\s*(?:the\s*)?maximum|payload|권장\s*상한|413/i.test(
+    message
+  );
+}
+
+function isTransientTranscribeError(message = "") {
+  return /timed out|network|5\d{2}|429|rate\s*limit|temporarily|service\s+unavailable|bad\s+gateway|gateway\s*timeout/i.test(
+    message
+  );
 }
 
 function extractTranscriptFromPayload(payload, timeOffsetSec = 0) {
@@ -635,11 +748,21 @@ async function splitAudioForStt(file, targetBytes) {
     const channels = decoded.numberOfChannels;
     const sampleRate = decoded.sampleRate;
     const totalSamples = decoded.length;
-    const maxSamplesPerChunk = Math.max(
+    const minChunkCountByFileSize = Math.max(1, Math.ceil(file.size / STT_MAX_FILE_SIZE));
+    const maxSamplesBySize = Math.max(
       1,
       Math.floor((sampleRate * Math.max(targetBytes - 44, 0)) / Math.max(channels * 2, 1))
     );
+    const maxSamplesByFileSize = Math.floor(totalSamples / Math.max(1, minChunkCountByFileSize));
+    const maxSamplesPerChunk = Math.max(1, Math.min(maxSamplesBySize, maxSamplesByFileSize));
     const chunks = [];
+    const projectedChunkCount = Math.max(1, Math.ceil(totalSamples / maxSamplesPerChunk));
+    const chunkLabel = `${(file.size / (1024 * 1024)).toFixed(1)}MB`;
+    logJob(
+      appState.activeJobId,
+      "INFO",
+      `오디오 분할: ${chunkLabel} 소스 / 청크타입 ${Math.round(targetBytes / (1024 * 1024))}MB → ${projectedChunkCount}개 보장`
+    );
 
     let cursor = 0;
     while (cursor < totalSamples) {
@@ -1141,9 +1264,15 @@ function startLiveTicker() {
     liveProgress.style.width = `${job.progress}%`;
     const queuePos = queuePosition(job.id);
     const qtxt = queuePos ? `현재 대기순위: ${queuePos}` : "실시간 처리 중";
+    const idleSec = job.lastLogAt ? Math.floor((Date.now() - job.lastLogAt) / 1000) : 0;
+    const activityText = idleSec >= 20 ? ` · 마지막 로그 ${idleSec}초 전` : "";
+    if (idleSec >= 45 && !job.stallNoticeAt) {
+      job.stallNoticeAt = Date.now();
+      logJob(job.id, "WARN", "작업 응답이 지연되고 있습니다. 네트워크/요청 응답 대기 중일 수 있습니다.");
+    }
     const hasInlineDetail = typeof job.stage === "string" && job.stage.includes("(") && job.stage.includes(")");
     const liveDetail = !hasInlineDetail && job.progressDetail ? ` (${job.progressDetail})` : "";
-    liveMeta.textContent = `상태: ${job.stage}${liveDetail} · 진행률: ${job.progress.toFixed(1)}% · ${qtxt} · ${formatBytes(job.file.size)} · ${job.createdAt}`;
+    liveMeta.textContent = `상태: ${job.stage}${liveDetail} · 진행률: ${job.progress.toFixed(1)}% · ${qtxt} · ${formatBytes(job.file.size)} · ${job.createdAt}${activityText}`;
     renderLiveConsole();
   }, POLL_MS);
 }

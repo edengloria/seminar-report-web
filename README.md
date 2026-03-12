@@ -2,6 +2,8 @@
 
 원본 세미나 녹음 파일을 업로드하면
 - OpenAI STT(`gpt-4o-transcribe`)로 전사
+  - 25MB 초과 파일은 브라우저에서 자동 분할 후 처리
+  - 50MB 초과 파일은 업로드 거부(하드 제한)
 - 세미나 보고서 구조화 요약(JSON schema)
 - PDF/Markdown 생성 후 다운로드
 
@@ -22,8 +24,9 @@
 
 ## 확장자 지원
 
-`.m4a`, `.mp3`, `.wav`, `.ogg`, `.flac`, `.aac`, `.opus`, `.webm`, `.mp4`, `.mov`, `.m4v`, `.avi`
+`.m4a`, `.mp3`, `.wav`, `.ogg`, `.flac`, `.aac`, `.opus`, `.webm`, `.mp4`, `.mov`, `.m4v`, `.avi`, `.mkv`, `.3gp`, `.wma`, `.oga`, `.ogv`, `.mp4a`
 
+> 브라우저 분할은 오디오를 디코딩 후 유효한 WAV 청크로 재생성해 STT 호출합니다.  
 > OpenAI 오디오 API가 지원하지 않는 포맷은 브라우저 업로드 시 차단되거나 업로드 직후 오류가 납니다.
 
 ## 로컬 실행
@@ -67,7 +70,7 @@ gh api repos/<your-github-id>/<repo-name>/pages | jq .html_url
 ## 현재 처리 파이프라인
 
 1. 오디오 업로드(브라우저)
-2. `gpt-4o-transcribe`로 음성 전사
+2. 25MB 초과 시 자동 청킹 후 `gpt-4o-transcribe` 병렬/순차 전사
 3. `Responses API`로 요약(JSON 스키마) + map/reduce 병렬 fallback
 4. jsPDF로 PDF 생성 후 다운로드 링크 노출
 5. Markdown도 동시에 생성해 선택 다운로드

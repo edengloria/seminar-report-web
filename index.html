@@ -35,16 +35,16 @@
               <small>⚠️ 키는 코드나 저장소에 절대 저장되지 않으며, 브라우저 메모리에만 유지됩니다.</small>
             </label>
           </div>
-          <label>
-            녹음 파일
-            <input
-              id="audio-file"
-              type="file"
-              accept=".m4a,.mp3,.wav,.ogg,.flac,.aac,.opus,.webm,.mp4,.mov,.m4v,.avi,.mkv,.3gp,.wma,.oga,.ogv,.mp4a"
-              required
-            />
-            <small>지원 확장자: m4a, mp3, wav, ogg, flac, aac, opus, webm, mp4, mov, m4v 등</small>
-          </label>
+            <label>
+              녹음 파일
+              <input
+                id="audio-file"
+                type="file"
+                accept=".m4a,.mp3,.wav,.ogg,.flac,.aac,.opus,.webm,.mp4,.mov,.m4v,.avi,.mkv,.3gp,.wma,.oga,.ogv,.mp4a"
+                required
+              />
+              <small>지원 확장자: m4a, mp3, wav, ogg, flac, aac, opus, webm, mp4, mov, m4v 등. 25MB 초과 파일은 자동 분할 후 처리, 50MB 초과는 업로드 제한입니다.</small>
+            </label>
           <div class="actions">
             <button type="submit" id="submit-btn">업로드 및 처리 시작</button>
             <button type="button" id="clear-form-btn">입력값 초기화</button>

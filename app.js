@@ -1,6 +1,8 @@
 const STT_MODEL = "gpt-4o-transcribe";
 const SUMMARY_MODELS = ["gpt-4o", "gpt-4o-mini"];
-const MAX_FILE_SIZE = 25 * 1024 * 1024;
+const MAX_FILE_SIZE = 50 * 1024 * 1024;
+const STT_MAX_FILE_SIZE = 25 * 1024 * 1024;
+const STT_SEGMENT_BYTES = 24 * 1024 * 1024;
 const POLL_MS = 1000;
 const ALLOWED_EXTENSIONS = ["m4a", "mp3", "wav", "ogg", "flac", "aac", "opus", "webm", "mp4", "mov", "m4v", "avi", "mkv", "3gp", "oga", "ogv", "wma", "mp4a"];
 
@@ -103,7 +105,7 @@ async function onSubmit(event) {
     return;
   }
   if (file.size > MAX_FILE_SIZE) {
-    formError.textContent = `파일 크기가 너무 큽니다. (${Math.round(file.size / (1024 * 1024))}MB). OpenAI 오디오 API 권장 상한(약 25MB) 이내로 업로드하세요.`;
+    formError.textContent = `파일 크기가 너무 큽니다. (${Math.round(file.size / (1024 * 1024))}MB). 50MB 이내로 업로드해 주세요.`;
     return;
   }
   const fileName = String(file.name || "").toLowerCase();
@@ -250,14 +252,65 @@ async function transcribeAudio(job) {
   const apiKey = appState.apiKey;
   if (!apiKey) throw new Error("API key missing");
 
+  if (job.file.size <= STT_MAX_FILE_SIZE) {
+    const single = await transcribeSingleFile(job.file, apiKey, 0);
+    logJob(job.id, "INFO", "transcription completed without split");
+    setStatus(job.id, "processing", "요약으로 텍스트 정리", 35);
+    return single.text;
+  }
+
+  logJob(job.id, "INFO", `파일 크기 ${Math.round(job.file.size / (1024 * 1024))}MB: STT 분할 모드로 처리합니다.`);
+  const segments = await splitAudioForStt(job.file, STT_SEGMENT_BYTES);
+  if (!segments.length) {
+    throw new Error("Failed to split audio into valid chunks");
+  }
+
+  const combinedTextParts = [];
+  const combinedSegments = [];
+
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    const progress = 5 + Math.round((30 * (i + 1)) / segments.length);
+    setStatus(job.id, "processing", `Whisper 전사 중 (분할 ${i + 1}/${segments.length})`, progress);
+    const result = await transcribeSingleFile(segment.blob, apiKey, segment.startTimeSec);
+    if (result.text) {
+      combinedTextParts.push(result.text);
+    }
+    if (Array.isArray(result.segments) && result.segments.length > 0) {
+      combinedSegments.push(...result.segments);
+    } else if (result.text) {
+      combinedSegments.push({
+        start: segment.startTimeSec,
+        end: segment.endTimeSec || segment.startTimeSec,
+        text: result.text,
+      });
+    }
+    logJob(job.id, "INFO", `transcribe segment ${i + 1}/${segments.length} done`);
+  }
+
+  const mergedText = combinedTextParts.join("\n").trim();
+  if (!mergedText) {
+    throw new Error("transcription failed");
+  }
+
+  logJob(
+    job.id,
+    "INFO",
+    `transcription completed with ${segments.length} chunks · timestamp aligned entries: ${combinedSegments.length}`
+  );
+  setStatus(job.id, "processing", "요약으로 텍스트 정리", 35);
+  job.output.transcriptAligned = combinedSegments;
+  return mergedText;
+}
+
+async function transcribeSingleFile(file, apiKey, timeOffsetSec = 0) {
   const model = STT_MODEL;
   const formats = model.includes("gpt-4o") ? ["json", "text"] : ["verbose_json", "json", "text"];
   let lastError = null;
-
   for (const responseFormat of formats) {
     try {
       const formData = new FormData();
-      formData.append("file", job.file);
+      formData.append("file", file);
       formData.append("model", model);
       formData.append("response_format", responseFormat);
       const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
@@ -272,30 +325,24 @@ async function transcribeAudio(job) {
         if (!body.includes("unsupported") && !body.includes("unsupported_value")) {
           throw err;
         }
-        // 특정 모델/포맷 조합 미지원 시 다음 포맷으로 fallback
         if (responseFormat !== "text") {
-          logJob(job.id, "WARN", `${responseFormat} 포맷 미지원 또는 오류 -> fallback`);
+          logJob(appState.activeJobId, "WARN", `${responseFormat} 포맷 미지원 또는 오류 -> fallback`);
           continue;
         }
         throw err;
       }
 
       if (responseFormat === "text") {
-        const txt = (await res.text()).trim();
-        logJob(job.id, "INFO", `transcription completed with text format`);
-        setStatus(job.id, "processing", "요약으로 텍스트 정리", 35);
-        return txt;
+        const text = (await res.text()).trim();
+        return { text, segments: [{ start: timeOffsetSec, end: timeOffsetSec, text }] };
       }
 
       const payload = await res.json();
-      const transcript = extractTranscriptFromPayload(payload);
-      logJob(job.id, "INFO", `transcription completed with ${responseFormat}`);
-      setStatus(job.id, "processing", "요약으로 텍스트 정리", 35);
-      return transcript;
+      return extractTranscriptFromPayload(payload, timeOffsetSec);
     } catch (error) {
       lastError = error;
       if (responseFormat !== "text") {
-        logJob(job.id, "WARN", `${responseFormat} 포맷 실패 -> 재시도`);
+        logJob(appState.activeJobId, "WARN", `${responseFormat} 포맷 실패 -> 재시도`);
         continue;
       }
       throw error;
@@ -304,26 +351,154 @@ async function transcribeAudio(job) {
   throw lastError || new Error("transcription failed");
 }
 
-function extractTranscriptFromPayload(payload) {
-  if (!payload) return "";
-  if (typeof payload.text === "string" && payload.text.trim()) return payload.text.trim();
+function extractTranscriptFromPayload(payload, timeOffsetSec = 0) {
+  if (!payload) return { text: "", segments: [] };
+  const startOffset = Number(timeOffsetSec) || 0;
+  const text = typeof payload.text === "string" && payload.text.trim() ? payload.text.trim() : "";
+  const segments = [];
   if (Array.isArray(payload.segments)) {
-    return payload.segments
-      .map((segment) => segment?.text || "")
-      .filter(Boolean)
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
+    for (const segment of payload.segments) {
+      const segText = String(segment?.text || "").trim();
+      if (!segText) continue;
+      const rawStart = Number(segment?.start);
+      const rawEnd = Number(segment?.end);
+      segments.push({
+        start: Number.isFinite(rawStart) ? startOffset + rawStart : startOffset,
+        end: Number.isFinite(rawEnd) ? startOffset + rawEnd : startOffset,
+        text: segText,
+      });
+    }
+  }
+  if (segments.length > 0 && text) {
+    return { text, segments };
+  }
+  if (Array.isArray(payload.segments)) {
+    return {
+      text: payload.segments
+        .map((segment) => segment?.text || "")
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim(),
+      segments: [],
+    };
   }
   if (Array.isArray(payload.words)) {
-    return payload.words
-      .map((w) => w.word || "")
-      .filter(Boolean)
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
+    const wordSegments = [];
+    for (const w of payload.words) {
+      const wText = String(w?.word || "").trim();
+      if (!wText) continue;
+      const rawStart = Number(w?.start);
+      const rawEnd = Number(w?.end);
+      wordSegments.push({
+        start: Number.isFinite(rawStart) ? startOffset + rawStart : startOffset,
+        end: Number.isFinite(rawEnd) ? startOffset + rawEnd : startOffset,
+        text: wText,
+      });
+    }
+    return {
+      text: payload.words
+        .map((w) => w.word || "")
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim(),
+      segments: wordSegments,
+    };
   }
-  return "";
+  return { text: "", segments: [] };
+}
+
+async function splitAudioForStt(file, targetBytes) {
+  const fileData = await file.arrayBuffer();
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) throw new Error("브라우저에서 AudioContext를 지원하지 않습니다.");
+  const audioCtx = new AudioCtx();
+  let decoded;
+
+  try {
+    decoded = await audioCtx.decodeAudioData(fileData);
+  } catch (error) {
+    await audioCtx.close().catch(() => {});
+    throw new Error(`오디오 디코딩 실패: ${String(error?.message || error)}`);
+  }
+
+  try {
+    const channels = decoded.numberOfChannels;
+    const sampleRate = decoded.sampleRate;
+    const totalSamples = decoded.length;
+    const maxSamplesPerChunk = Math.max(
+      1,
+      Math.floor((sampleRate * Math.max(targetBytes - 44, 0)) / Math.max(channels * 2, 1))
+    );
+    const chunks = [];
+
+    let cursor = 0;
+    while (cursor < totalSamples) {
+      const end = Math.min(totalSamples, cursor + maxSamplesPerChunk);
+      const chunkLen = end - cursor;
+      const segmentBuffer = audioCtx.createBuffer(channels, chunkLen, sampleRate);
+      for (let ch = 0; ch < channels; ch++) {
+        const source = decoded.getChannelData(ch);
+        const target = segmentBuffer.getChannelData(ch);
+        target.set(source.subarray(cursor, end), 0);
+      }
+
+      const wav = encodeWavFromAudioBuffer(segmentBuffer);
+      chunks.push({
+        blob: new Blob([wav], { type: "audio/wav" }),
+        startTimeSec: cursor / sampleRate,
+        endTimeSec: end / sampleRate,
+      });
+      cursor = end;
+    }
+
+    return chunks;
+  } finally {
+    await audioCtx.close().catch(() => {});
+  }
+}
+
+function encodeWavFromAudioBuffer(audioBuffer) {
+  const numChannels = audioBuffer.numberOfChannels;
+  const sampleRate = audioBuffer.sampleRate;
+  const bitDepth = 16;
+  const blockAlign = numChannels * (bitDepth / 8);
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = audioBuffer.length * blockAlign;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  const writeStr = (offset, str) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitDepth, true);
+  writeStr(36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let pos = 44;
+  for (let i = 0; i < audioBuffer.length; i++) {
+    for (let c = 0; c < numChannels; c++) {
+      const sample = Math.max(-1, Math.min(1, audioBuffer.getChannelData(c)[i]));
+      const int16 = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+      view.setInt16(pos, int16, true);
+      pos += 2;
+    }
+  }
+  return buffer;
 }
 
 async function summarizeTranscript(job, transcriptText) {
